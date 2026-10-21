@@ -207,6 +207,14 @@ def forecast(config):
     out_shape=(1,members,round(days),len(out_names),sample_ds.sizes['latitude'],sample_ds.sizes['longitude'])
     base_file=np.lib.format.open_memmap(output/'baseline.npy',mode='w+',dtype='float32',shape=out_shape)
     ens_file=np.lib.format.open_memmap(output/'ensemble.npy',mode='w+',dtype='float32',shape=out_shape)
+    # Spatially correlated closure noise; 0 restores independent columns.
+    correlation_km=float(config.get('noise_correlation_km',500))
+    noise_fn=backend.spherical_noise(correlation_km) if correlation_km>0 else None
+    perturbation=config.get('initial_perturbation')
+    if perturbation is not None:
+        unknown=set(perturbation)-{'temperature_k','wind_ms','correlation_km'}
+        if unknown: raise ValueError(f'Unknown initial_perturbation keys: {sorted(unknown)}')
+        perturbation_fn=backend.spherical_noise(float(perturbation.get('correlation_km',500)))
     for member in range(members):
         # Historical residual proxy uses fixed encoder noise, matching preparation.
         states=[]; residuals=[]; previous_prediction=None
@@ -220,13 +228,25 @@ def forecast(config):
             if i<origin:
                 pred=backend.advance_interval(current,forcing,dt)
                 previous_prediction=pack_sigma(backend.sigma_fields(pred),variables)
-        # Matched base and corrected initial stochastic state; independent per member.
-        initial=backend.encode(inputs,forcing,rng_key=jax.random.PRNGKey(config.get('seed',42)+member))
+        # Matched base and corrected initial state; independent per member.
+        # Separate keys for the encoder, the initial perturbation and the closure.
+        encoder_member,perturb_key,closure_key=jax.random.split(
+            jax.random.fold_in(jax.random.PRNGKey(config.get('seed',42)),member),3)
+        initial=backend.encode(inputs,forcing,rng_key=encoder_member)
+        if perturbation is not None:
+            sigma=backend.sigma_shape[0]
+            unit=np.asarray(perturbation_fn(perturb_key,3*sigma)).swapaxes(-1,-2)
+            initial=backend.perturb(initial,{
+                'temperature':float(perturbation.get('temperature_k',0.5))*unit[:sigma],
+                'u':float(perturbation.get('wind_ms',1.0))*unit[sigma:2*sigma],
+                'v':float(perturbation.get('wind_ms',1.0))*unit[2*sigma:]})
         states[-1]=pack_sigma(backend.sigma_fields(initial),variables)
         controller=ClosureController(checkpoint,np.stack(states),np.stack(residuals),
-            seed=config.get('seed',42)+member,correction_scale=config.get('correction_scale',0.1),
+            seed=closure_key,correction_scale=config.get('correction_scale',0.1),
             tendency_clip_std=config.get('tendency_clip_std',5),tile_columns=config.get('tile_columns',256),
-            mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96))
+            mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96),
+            noise_fn=noise_fn,slow_noise=config.get('slow_noise',True),
+            slow_noise_scale=config.get('slow_noise_scale',1.0))
         base=initial; corrected=initial
         for step in range(round(days*86400/dt)):
             check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
@@ -265,6 +285,13 @@ def forecast(config):
         'correction_scale':config.get('correction_scale',0.1),'seed':config.get('seed',42),
         'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
         'closure_checkpoint':str(config['closure_checkpoint']),'status':'forecast only; skill unverified'}
+    metadata['noise_correlation_km']=correlation_km
+    metadata['slow_noise']=bool(config.get('slow_noise',True)) and 'slow_cholesky' in (checkpoint.get('noise_model') or {})
+    metadata['initial_perturbation']=perturbation
+    # A deterministic baseline repeated M times has no spread: ensemble-mean
+    # RMSE and CRPS of the candidate then improve from averaging alone.
+    metadata['baseline_spread_source']=('matched initial perturbation' if perturbation is not None
+        else 'NeuralGCM internal randomness only (none for deterministic checkpoints)')
     metadata['evaluation_split']=split
     metadata['split_bounds_checked']=split is not None
     write_json(output/'forecast.json',metadata)
@@ -300,6 +327,9 @@ def verify(config):
         evaluation_split=config.get('evaluation_split','test'),
         climatology_provenance=config['climatology_provenance'],
         budget_gib=config.get('memory_limit_gb',96)*1e9/1024**3)
+    if metadata.get('initial_perturbation') is None and metadata.get('members',1)>1:
+        result['comparison_warning']=('Baseline members differ only through NeuralGCM internal randomness. '
+            'For a deterministic checkpoint, set initial_perturbation so ensemble-mean RMSE/CRPS gains are not an averaging artefact.')
     write_json(output/'evaluation.json',result)
     return result
 

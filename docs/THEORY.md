@@ -108,9 +108,35 @@ Mori–Zwanzig reduction distinguishes a resolved/Markovian term, a history term
 
 Hasselmann's construction concerns a slow system's response to rapidly decorrelating forcing, with stabilizing feedback yielding stationary red variability. It motivates keeping past shocks relevant to subsequent dynamics. It does not imply that an individual future weather shock is known, or that adding noise improves forecast accuracy.
 
-**Strict high-pass filtering has an important limitation.** Removing the DC coefficient makes the generated fast branch's sampled sum zero over each full block. A pure linear accumulation of those samples therefore has no stochastic block-mean increment. More generally, a strict spectral gap at low frequency is not the standard Hasselmann forcing assumption: rapidly decorrelating forcing can still have nonzero spectral density near zero frequency.
+**Strict high-pass filtering alone has no zero-frequency forcing.** Removing the DC coefficient makes the generated fast branch's sampled sum zero over each full block, so a linear accumulation of those samples has no stochastic block-mean increment. Hasselmann forcing, by contrast, decorrelates rapidly but has nonzero spectral density near zero frequency. The forcing therefore has a second, **slow stochastic branch**.
 
-The separate history mean is learned from the full target and supplies a route for slow response and bias correction. Past sampled corrections also condition later means. Those paths, changing block boundaries and nonlinear resolved dynamics can produce slow variation, but **they do not prove a Hasselmann red spectrum**. Measure the full concatenated rollout spectrum and autocorrelation, including block boundaries. A stochastic DC/low-frequency branch would be a separate extension and is not part of the current strict-high-pass DDPM. The resulting response should be compared against memory-only and noise-without-memory ablations.
+## Zero-frequency AR(1) branch
+
+After the history mean is fitted, the block mean of the training innovation
+
+\[
+ d_n = \frac1K\sum_{j=0}^{K-1}\bigl(r_{n+j}-\mu_\theta(h_n)_j\bigr)
+\]
+
+is exactly the part the fast DDPM cannot generate. Its channel covariance \(\Sigma=LL^\top\) and its pooled lag-one correlation between consecutive blocks \(\phi\) are fitted on training windows. During rollout each block receives a block-constant normalized forcing
+
+\[
+ s_{b+1}=\phi s_b+\sqrt{1-\phi^2}\,L z_b,\qquad s_0=Lz_0,
+\]
+
+which is stationary with covariance \(\Sigma\). For a slow variable with damping \(\lambda\), \(\dot y=-\lambda y+s\), the response variance grows like that of a random walk until \(t\sim1/\lambda\), then saturates with a red spectrum: the Hasselmann mechanism. Zero-sum fast forcing gives no such accumulation (`tests/test_long_term_noise.py` checks both). A single pooled \(\phi\) keeps the vector process stationary for any \(\Sigma\); channel-dependent memory is a possible extension.
+
+## Spatially correlated draws
+
+Column-wise networks with independent column noise produce spatially white forcing. On TL63 about half of its variance is beyond the spectral truncation and the resolved remainder sits at the smallest scales, where hyperdiffusion removes it (a 6-hour temperature response of 38% of the injected amount, against 86% for a smooth pattern). All Gaussian draws, the DDPM prior and every reverse-step noise as well as the AR(1) shocks, therefore come from isotropic fields with spectral variance \(\exp(-l(l+1)L^2/(2R^2))\) (`noise_correlation_km`, default 500 km), normalized to unit pointwise variance. Because the denoiser is column-wise, each column's marginal reverse process is unchanged; only the cross-column covariance becomes realistic. The correlation length is a modelling choice to validate, not fitted from data.
+
+## Amplitude calibration and memory consistency
+
+A small denoiser with few reverse steps does not reproduce the target variance; a known Gaussian test showed 1.35–1.8× inflation, while the exact-score sampler itself under-disperses by 6–13%. After training, a per-(mode, channel) gain matching sample spread to held-out innovation spread is fitted on validation windows and applied to the DCT coefficients.
+
+The history network was trained on past *residuals*. In rollout the memory therefore stores the closure's own unscaled residual estimate (mean + noise, before `correction_scale`), and only the applied forcing is scaled. The pure-base first interval stores the training-mean residual, which normalizes to zero, instead of an out-of-distribution exact zero.
+
+The history mean, prior sampled corrections conditioning later means, and the nonlinear resolved dynamics are additional slow pathways. None of this proves a realistic low-frequency spectrum; measure rollout spectra, autocorrelation and drift, and compare `full`, `memory` (mean only), `noise` (noise only) and `off`.
 
 ## What 40-day evaluation establishes
 

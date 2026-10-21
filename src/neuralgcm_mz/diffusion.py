@@ -54,26 +54,34 @@ def diffusion_loss(params, key, target_coeff, history, mask, steps=32):
     return jnp.sum((predicted-noise)**2) / (jnp.sum(mask)*target_coeff.shape[0]*target_coeff.shape[2])
 
 
+def reverse_step(params, x, history, t, noise, mask, steps=32):
+    """One ancestral DDPM step at index t, given unit Gaussian ``noise``.
+
+    The caller owns the noise so that it may be spatially correlated across
+    columns. Each column still receives marginally standard normal noise, so
+    the per-column reverse process is unchanged.
+    """
+    beta, alpha, abar = schedule(steps)
+    m = mask[None, :, None]
+    time = jnp.full((x.shape[0],), t / (steps - 1))
+    eps = denoise(params, x, history, time) * m
+    mean = (x - beta[t] / jnp.sqrt(1-abar[t]) * eps) / jnp.sqrt(alpha[t])
+    previous = jnp.where(t > 0, abar[jnp.maximum(t-1, 0)], 1.)
+    variance = beta[t] * (1-previous) / (1-abar[t])
+    return (mean + jnp.where(t > 0, jnp.sqrt(variance) * noise, 0)) * m
+
+
 def sample(params, key, history, mask, steps=32):
     """One sample per physical block; never call inside ODE RHS/stages."""
-    beta, alpha, abar = schedule(steps)
     k, c = params["b3"].shape
     shape = (history.shape[0], k, c)
     key, initial_key = jax.random.split(key)
-    m = mask[None, :, None]
-    initial = jax.random.normal(initial_key, shape) * m
+    initial = jax.random.normal(initial_key, shape) * mask[None, :, None]
 
     def reverse(i, carry):
         x, rng = carry
-        t = steps - 1 - i
         rng, noise_key = jax.random.split(rng)
-        time = jnp.full((shape[0],), t / (steps - 1))
-        eps = denoise(params, x, history, time) * m
-        mean = (x - beta[t] / jnp.sqrt(1-abar[t]) * eps) / jnp.sqrt(alpha[t])
-        previous = jnp.where(t > 0, abar[jnp.maximum(t-1, 0)], 1.)
-        variance = beta[t] * (1-previous) / (1-abar[t])
         noise = jax.random.normal(noise_key, shape)
-        x = (mean + jnp.where(t > 0, jnp.sqrt(variance) * noise, 0)) * m
-        return x, rng
+        return reverse_step(params, x, history, steps - 1 - i, noise, mask, steps), rng
 
     return jax.lax.fori_loop(0, steps, reverse, (initial, key))[0]

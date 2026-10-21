@@ -49,3 +49,24 @@ def test_real_neuralgcm_internal_tendency_and_zero_identity():
         backend.step(state, forcing, {"geopotential": np.zeros(backend.sigma_shape)})
     with pytest.raises(ValueError, match="positive multiple"):
         backend.advance_interval(state, forcing, backend.timestep_seconds / 2)
+
+
+def test_real_neuralgcm_perturbation_and_spherical_noise():
+    jax = pytest.importorskip("jax")
+    neuralgcm = pytest.importorskip("neuralgcm")
+    from neuralgcm import demo
+    from neuralgcm_mz.neuralgcm_backend import NeuralGCMBackend
+
+    model = neuralgcm.PressureLevelModel.from_checkpoint(demo.load_checkpoint_tl63_stochastic())
+    backend = NeuralGCMBackend(model)
+    data = demo.load_data(model.data_coords).isel(time=0)
+    state = backend.encode(model.inputs_from_xarray(data), model.forcings_from_xarray(data),
+                           rng_key=jax.random.PRNGKey(7))
+    before = backend.sigma_fields(state)
+    after = backend.sigma_fields(backend.perturb(state, {"temperature": np.ones(backend.sigma_shape, np.float32)}))
+    np.testing.assert_allclose(np.mean(after["temperature"] - before["temperature"]), 1, rtol=1e-3)
+    np.testing.assert_allclose(after["u"], before["u"], atol=1e-4)
+    fields = np.asarray(backend.spherical_noise(500)(jax.random.PRNGKey(0), 64))
+    sigma, lon, lat = backend.sigma_shape
+    assert fields.shape == (64, lat, lon)
+    np.testing.assert_allclose(fields.var(), 1, rtol=0.1)

@@ -34,12 +34,15 @@ class TrainingConfig:
     seed: int = 42
     memory_limit_gb: float = 96.0
     normalization_chunk_steps: int = 4
+    calibration_batches: int = 16
+    slow_noise_batches: int = 64
 
     def __post_init__(self):
         positive_int = (
             "history_steps", "block_steps", "hidden", "diffusion_steps",
             "batch_columns", "closure_updates", "diffusion_updates",
             "validation_every", "validation_batches", "normalization_chunk_steps",
+            "calibration_batches", "slow_noise_batches",
         )
         for name in positive_int:
             value = getattr(self, name)
@@ -196,14 +199,7 @@ def _check_rss(limit_gb):
         raise MemoryError(f"Process RSS {rss/1e9:.2f} GB reached the safety margin for {limit_gb:g} GB")
 
 
-def sample_batch(archive, origins, config, normalizer, rng):
-    """Read random columns from one origin; never materialize a global window.
-
-    Each past residual ends at its corresponding conditioning state. In
-    particular residual[origin] is a target and cannot appear in the history.
-    Latitude sampling is proportional to cos(latitude), for area-weighted
-    fitting on latitude-longitude grids.
-    """
+def _draw_columns(archive, origins, config, rng):
     if len(origins) == 0:
         raise ValueError("Split is too short for history and future block")
     origin = origins[int(rng.integers(len(origins)))]
@@ -213,6 +209,21 @@ def sample_batch(archive, origins, config, normalizer, rng):
         raise ValueError("Latitude grid has no positive area")
     ys = rng.choice(ny, config.batch_columns, p=weights / weights.sum())
     xs = rng.integers(nx, size=config.batch_columns)
+    return origin, ys, xs
+
+
+def sample_batch(archive, origins, config, normalizer, rng):
+    """Read random columns from one origin; never materialize a global window.
+
+    Each past residual ends at its corresponding conditioning state. In
+    particular residual[origin] is a target and cannot appear in the history.
+    Latitude sampling is proportional to cos(latitude), for area-weighted
+    fitting on latitude-longitude grids.
+    """
+    return _window(archive, *_draw_columns(archive, origins, config, rng), config, normalizer)
+
+
+def _window(archive, origin, ys, xs, config, normalizer):
     h, k = config.history_steps, config.block_steps
     # Slice time first: NumPy mixed advanced indexing would otherwise move the
     # column axis to the front depending on the exact expression.
@@ -224,6 +235,56 @@ def sample_batch(archive, origins, config, normalizer, rng):
     if not np.isfinite(history).all() or not np.isfinite(target).all():
         raise ValueError("Selected training/validation window contains non-finite values")
     return history, target
+
+
+def fit_slow_noise(archive, origins, config, normalizer, rng, innovation):
+    """Covariance and block-to-block memory of the block-mean innovation.
+
+    The fast DDPM sees only DCT modes k>0, whose sum over each block is
+    exactly zero. The remaining block mean of ``target - closure mean`` is
+    the zero-frequency forcing that a Hasselmann-type slow response
+    integrates. It is modelled as a vector AR(1) process over consecutive
+    blocks, s' = phi s + sqrt(1-phi^2) L z, with L the Cholesky factor of the
+    channel covariance and one pooled phi (keeps the process stationary).
+    ``origins`` must allow two consecutive blocks inside the split.
+    """
+    k = config.block_steps
+    first, second = [], []
+    for _ in range(config.slow_noise_batches):
+        origin, ys, xs = _draw_columns(archive, origins, config, rng)
+        for target_list, start in ((first, origin), (second, origin + k)):
+            history, target = _window(archive, start, ys, xs, config, normalizer)
+            target_list.append(np.asarray(innovation(history, target)).mean(axis=1))
+    a = np.concatenate(first).astype(np.float64)
+    b = np.concatenate(second).astype(np.float64)
+    a -= a.mean(axis=0)
+    b -= b.mean(axis=0)
+    covariance = a.T @ a / len(a)
+    scale = max(float(np.mean(np.diag(covariance))), 1e-12)
+    cholesky = np.linalg.cholesky(covariance + 1e-6 * scale * np.eye(len(covariance)))
+    phi = float(np.clip(np.sum(a * b) / max(np.sum(a * a), 1e-12), 0.0, 0.99))
+    return {"slow_cholesky": cholesky.astype(np.float32), "slow_phi": phi,
+            "slow_std": np.sqrt(np.diag(covariance)).astype(np.float32),
+            "slow_samples": int(len(a))}
+
+
+def calibrate_diffusion(sampler, batches, mask):
+    """Per (mode, channel) gain matching DDPM sample spread to held-out innovations.
+
+    A small denoiser with few reverse steps does not reproduce the target
+    variance (both inflation and sampler under-dispersion occur). The gain
+    is fitted on validation windows only and clipped to [0.2, 5].
+    """
+    target_power = 0.
+    sample_power = 0.
+    for i, (history, coefficients) in enumerate(batches):
+        draw = np.asarray(sampler(i, history))
+        target_power = target_power + np.sum(np.asarray(coefficients, np.float64)**2, axis=0)
+        sample_power = sample_power + np.sum(draw.astype(np.float64)**2, axis=0)
+    active = np.asarray(mask)[:, None] > 0
+    ratio = np.sqrt(target_power / np.maximum(sample_power, 1e-30))
+    gain = np.where(active, np.clip(ratio, 0.2, 5.0), 1.0)
+    return gain.astype(np.float32)
 
 
 def train(archive_path, output_path, config: TrainingConfig | None = None):
@@ -339,8 +400,31 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
                 best_value, best_diffusion = value, diffusion_params
             trace.append({"stage": "diffusion", "update": step, "train_loss": train_loss, "validation_loss": value})
             _check_rss(config.memory_limit_gb)
+    # Noise calibration: amplitude per mode and the zero-frequency AR(1) branch.
+    from .diffusion import sample as ddpm_sample
+    crng = np.random.default_rng(config.seed + 3)
+    calibration = [sample_batch(archive, validation_origins, config, normalizer, crng)
+                   for _ in range(config.calibration_batches)]
+    draw = jax.jit(lambda k, h: ddpm_sample(best_diffusion, k, h, mask, config.diffusion_steps))
+    calibration_key = jax.random.PRNGKey(config.seed + 4)
+    diffusion_gain = calibrate_diffusion(
+        lambda i, h: draw(jax.random.fold_in(calibration_key, i), h),
+        [(h, innovation_coefficients(h, t)) for h, t in calibration], mask)
+    pair_origins = archive.window_origins("train", config.history_steps, 2 * config.block_steps)
+    if not pair_origins:
+        raise ValueError("Training split needs history_steps + 2*block_steps samples for slow noise")
+    innovation = jax.jit(lambda h, t: t - predict_closure(closure_params, h))
+    slow = fit_slow_noise(archive, pair_origins, config, normalizer,
+                          np.random.default_rng(config.seed + 5), innovation)
+    noise_model = {"version": 1, "diffusion_gain": diffusion_gain, **slow}
     summary = {
         "closure_validation_loss": closure_validation_loss,
+        "noise_calibration": {"diffusion_gain_min": float(np.min(diffusion_gain)),
+                              "diffusion_gain_max": float(np.max(diffusion_gain)),
+                              "slow_phi": slow["slow_phi"],
+                              "slow_std_mean": float(np.mean(slow["slow_std"])),
+                              "slow_samples": slow["slow_samples"],
+                              "gain_fit_split": "validation", "slow_fit_split": "train"},
         "diffusion_validation_loss": best_value,
         "normalization_fit_split": "train", "train_bounds": [start, stop],
         "train_windows": len(train_origins), "validation_windows": len(validation_origins),
@@ -354,6 +438,7 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
         "config": asdict(config),
         "closure_params": closure_params,
         "diffusion_params": best_diffusion,
+        "noise_model": noise_model,
         "normalizer": normalizer,
         "channel_names": list(archive.channel_names),
         "state_units": archive.manifest["state_units"],

@@ -26,7 +26,9 @@ The first forecast interval is pure NeuralGCM. Later noise blocks are generated 
 | Gaussian-base diffusion | Conditional **DDPM**, cosine schedule; Gaussian corruption/prior, learned residual distribution; no flow matching |
 | NeuralGCM residual | `(encoded ERA5 next − frozen NeuralGCM next) / Δt`, in SI per second |
 | Time-axis DCT | Orthonormal DCT-II on genuine regular samples; frequency `k/(2NΔt)` |
-| Short weather noise | Period≤48h for6h observations, DC excluded |
+| Short weather noise | Period≤48h for6h observations, DC excluded; per-mode amplitude calibrated on validation |
+| Long-term (Hasselmann) noise | Zero-frequency AR(1) branch fitted to block-mean innovations; block-constant, persistent across blocks |
+| Spatial structure | All Gaussian draws are isotropic fields (`noise_correlation_km`, default 500 km), unit pointwise variance |
 | Memory in learned physics | All-channel state and past-correction history conditions both networks; tendency added **before original IMEX integration** |
 |40-day forecast |160 six-hour intervals, daily pressure-level outputs, streamed ensemble members |
 |96GB / venv | Batched columns, memmaps, RAM preflight/RSS checks, optional kernel cgroup cap; pinned CPU environment |
@@ -75,7 +77,7 @@ ngcm-mz-workflow verify configs/verify.example.json
 
 The standalone verification configuration requires a training-only pressure climatology `.npy`. The combined `run` command creates it. Alternatively `ngcm-mz-workflow climatology config.json` accepts preparation settings plus a `climatology` output path. Its annual mean is a simple baseline: use day-of-year/valid-time training climatology for seasonal ACC studies. The evaluator accepts `[channel,lat,lon]` or `[case,lead,channel,lat,lon]` climatology.
 
-Forecast modes: `full`, `memory` (diffusion disabled), and `off` (exact base). `correction_scale=0` bypasses correction. The example0.1 is **uncalibrated**. Select strength using validation rollouts, then freeze it before held-out tests. The combined experiment defaults to no RMSE worsening at day1/3/5 (`short_tolerance=0`). This descriptive gate is not a statistical guarantee. Evaluate many initial dates and use scale0 if no candidate meets your short-term criterion.
+Forecast modes: `full`, `memory` (noise disabled), `noise` (noise only, no history mean or bias) and `off` (exact base). `slow_noise=false` or `slow_noise_scale` ablate the zero-frequency branch; `noise_correlation_km=0` restores independent columns. For deterministic checkpoints set `initial_perturbation` (shared by each baseline/candidate member pair); otherwise the baseline ensemble has no spread and ensemble-mean RMSE/CRPS gains are an averaging artefact. See `experiments/noise_response_tl63.py` for the forcing-response mechanism experiment. `correction_scale=0` bypasses correction. The example0.1 is **uncalibrated**. Select strength using validation rollouts, then freeze it before held-out tests. The combined experiment defaults to no RMSE worsening at day1/3/5 (`short_tolerance=0`). This descriptive gate is not a statistical guarantee. Evaluate many initial dates and use scale0 if no candidate meets your short-term criterion.
 
 ## Data contract
 
@@ -90,7 +92,7 @@ Forecast modes: `full`, `memory` (diffusion disabled), and `off` (exact base). `
 
 ## Scientific scope
 
-This is a **finite-history MZ-inspired closure**, adapted from the lagged-history idea in `Hist_Bayesian_Closure`, not an exact orthogonal-dynamics solver or enforced fluctuation-dissipation identity. DDPM Gaussian corruption is distinct from physical white noise. Strict high-pass forcing has zero block mean and does not alone establish Hasselmann red-noise accumulation. A full-band learned history mean supplies possible slower response; prior stochastic corrections influence subsequent conditioning. Realistic low-frequency spectra still require measurement.
+This is a **finite-history MZ-inspired closure**, adapted from the lagged-history idea in `Hist_Bayesian_Closure`, not an exact orthogonal-dynamics solver or enforced fluctuation-dissipation identity. DDPM Gaussian corruption is distinct from physical white noise. The fast high-pass branch has zero block mean; a separate zero-frequency AR(1) branch supplies the nonzero low-frequency forcing that Hasselmann accumulation needs. The learned history mean and prior stochastic corrections (stored unscaled, as in training) add further slow pathways. Realistic low-frequency spectra still require measurement.
 
 NeuralGCM parameters remain frozen. Training fits encoded interval-average tendency proxies offline, not end-to-end40-day rollout loss. Encoder/reconstruction and numerical errors are part of the target. A shared column MLP sees all variable/level history but lacks a horizontal joint noise covariance model. Full ArchesWeather and ClimateDiffuse spatial architectures are not embedded. Generated-history distribution shift, stability and physical budget drift require validation. A gain constant over each time block bounds amplitudes while preserving the fast component's spectral support; it is not a conservation constraint.
 

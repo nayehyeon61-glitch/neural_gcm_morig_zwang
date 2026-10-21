@@ -88,6 +88,9 @@ class FakeBackend:
         return {"temperature": state}
     def persisted_forcings(self, state, forcing):
         return forcing
+    def spherical_noise(self, length_km):
+        from neuralgcm_mz.spatial import independent_noise
+        return independent_noise(2, 2)
 
 
 class FakeReader:
