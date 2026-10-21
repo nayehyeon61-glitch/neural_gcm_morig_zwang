@@ -1,4 +1,5 @@
 """Small contract tests for I/O boundaries, independent of a real checkpoint."""
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -163,6 +164,27 @@ def test_prepare_produces_sigma_residuals_with_correct_units(tmp_path, monkeypat
     assert archive.manifest["residual_units"] == ["(K) s^-1"]
     assert archive.manifest["provenance"]["coordinate_system"] == "NeuralGCM native sigma nodal"
     assert archive.manifest["provenance"]["neuralgcm_sha256"] == workflow.checkpoint_sha256(base_checkpoint)
+
+
+def test_forecast_history_follows_archive_memory_mode(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    calls = []
+    backend.with_memory = lambda state, previous: calls.append(1) or state
+    FakeReader.max_allowed = 2
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    monkeypatch.setattr(workflow, "ClosureController", FakeController)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
+        "channel_names": ["temperature:sigma_0"], "dt_seconds": 86400, "config": {"history_steps": 2},
+        "provenance": {"neuralgcm_sha256": workflow.checkpoint_sha256(base_checkpoint), "memory": "warm (x)"}})
+    workflow.forecast({"neuralgcm_checkpoint": str(base_checkpoint), "closure_checkpoint": "model.npz",
+                       "variables": ["temperature"], "era5": "dummy", "issue_time": "2000-01-03",
+                       "output": str(tmp_path/"forecast"), "days": 2, "members": 1})
+    assert len(calls) == 1  # history intervals 0 (cold, no past) and 1 (warm)
+    meta = json.loads((tmp_path/"forecast"/"forecast.json").read_text())
+    assert meta["history_memory"] == "warm"
 
 
 def test_prepare_warm_memory_uses_previous_trajectory(tmp_path, monkeypatch):

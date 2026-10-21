@@ -255,9 +255,11 @@ def forecast(config):
         unknown=set(perturbation)-{'temperature_k','wind_ms','correlation_km'}
         if unknown: raise ValueError(f'Unknown initial_perturbation keys: {sorted(unknown)}')
         perturbation_fn=backend.spherical_noise(float(perturbation.get('correlation_km',500)))
+    warm_history=str(checkpoint.get('provenance',{}).get('memory','cold')).startswith('warm')
     for member in range(members):
         # Historical residual proxy uses fixed encoder noise, matching preparation.
-        states=[]; residuals=[]; previous_prediction=None
+        # History residuals are formed the way the training archive was (warm or cold memory).
+        states=[]; residuals=[]; previous_prediction=None; previous=None
         encoder_key=jax.random.PRNGKey(trained_seed)
         for i in range(origin-h,origin+1):
             _,inputs,forcing=reader.record(i)
@@ -266,7 +268,13 @@ def forecast(config):
             if previous_prediction is not None:
                 states.append(field); residuals.append((field-previous_prediction)/dt)
             if i<origin:
-                pred=backend.advance_interval(current,forcing,dt)
+                if warm_history:
+                    if previous is not None:
+                        current=backend.with_memory(current,previous)
+                    previous=backend.advance_interval(current,forcing,dt-backend.timestep_seconds)
+                    pred=backend.advance_interval(previous,forcing,backend.timestep_seconds)
+                else:
+                    pred=backend.advance_interval(current,forcing,dt)
                 previous_prediction=pack_sigma(backend.sigma_fields(pred),variables)
         # Matched base and corrected initial state; independent per member.
         # Separate keys for the encoder, the initial perturbation and the closure.
@@ -332,6 +340,7 @@ def forecast(config):
     metadata['noise_correlation_km']=correlation_km
     metadata['slow_noise_correlation_km']=slow_correlation_km
     metadata['noise_scale']=common
+    metadata['history_memory']='warm' if warm_history else 'cold'
     metadata['fast_noise_scale']=fast_scale
     metadata['slow_noise']=(bool(config.get('slow_noise',True)) and slow_scale>0
         and 'slow_cholesky' in (checkpoint.get('noise_model') or {}))
