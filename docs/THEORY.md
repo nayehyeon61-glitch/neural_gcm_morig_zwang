@@ -128,7 +128,7 @@ which is stationary with covariance \(\Sigma\). For a slow variable with damping
 
 ## Spatially correlated draws
 
-Column-wise networks with independent column noise produce spatially white forcing. On TL63 about half of its variance is beyond the spectral truncation and the resolved remainder sits at the smallest scales, where hyperdiffusion removes it (a 6-hour temperature response of 38% of the injected amount, against 86% for a smooth pattern). All Gaussian draws, the DDPM prior and every reverse-step noise as well as the AR(1) shocks, therefore come from isotropic fields with spectral variance \(\exp(-l(l+1)L^2/(2R^2))\) (`noise_correlation_km`, default 500 km), normalized to unit pointwise variance. Because the denoiser is column-wise, each column's marginal reverse process is unchanged; only the cross-column covariance becomes realistic. The correlation length is a modelling choice to validate, not fitted from data.
+Column-wise networks with independent column noise produce spatially white forcing. On TL63 about half of its variance is beyond the spectral truncation and the resolved remainder sits at the smallest scales, where hyperdiffusion removes it (a 6-hour temperature response of 38% of the injected amount, against 86% for a smooth pattern). All Gaussian draws, the DDPM prior and every reverse-step noise as well as the AR(1) shocks, therefore come from isotropic fields with spectral variance \(\exp(-l(l+1)L^2/(2R^2))\) (`noise_correlation_km`), normalized to unit pointwise variance. Because the denoiser is column-wise, each column's marginal reverse process is unchanged; only the cross-column covariance becomes realistic. Training estimates the zonal correlation length of the fast and block-mean innovations separately (`correlation_km_fast`, `correlation_km_slow`) and forecasts use them unless overridden; 500 km is only the fallback for older checkpoints. Draws are independent across (mode, channel), so inter-channel structure comes from the denoiser alone.
 
 ## Amplitude calibration and memory consistency
 
@@ -137,6 +137,14 @@ A small denoiser with few reverse steps does not reproduce the target variance; 
 The history network was trained on past *residuals*. In rollout the memory therefore stores the closure's own unscaled residual estimate (mean + noise, before `correction_scale`), and only the applied forcing is scaled. The pure-base first interval stores the training-mean residual, which normalizes to zero, instead of an out-of-distribution exact zero.
 
 The history mean, prior sampled corrections conditioning later means, and the nonlinear resolved dynamics are additional slow pathways. None of this proves a realistic low-frequency spectrum; measure rollout spectra, autocorrelation and drift, and compare `full`, `memory` (mean only), `noise` (noise only) and `off`.
+
+## Fast-noise strength
+
+`fast_noise_scale` multiplies only the DDPM branch; `slow_noise_scale` the AR(1) branch. Correlated draws change the short-range impact of the same nominal amplitude: on the TL63 core with a unit-variance (gain-normalized) untrained sampler, the day-1 temperature response was 0.093 K for independent columns and 0.174 K for correlated draws (day 5: 0.32 and 0.47 K), at equal forcing rms of 0.75 K/day. Keeping the previous short-range impact therefore needs a fast scale near 0.5, which the example configurations use as a conservative start. The real choice is made on validation data with `ngcm-mz-workflow calibrate` (`configs/calibrate.example.json`): every case must pass the day 1/3/5 RMSE gate, and among those the scale whose median spread/skill is closest to 1 (at most 1 + tolerance) wins, else 0.
+
+The clip (`tendency_clip_std`) acts after the strengths. If raw closure output exceeds it, the clip and not the strength sets the amplitude; an untrained sampler produced about 300σ and made every scale identical until its gain was normalized. Check the clipped fraction on trained checkpoints.
+
+With K = 8 six-hour steps and a 48 h cutoff, DCT mode k = 1 (96 h period) is in neither branch: it is carried only by the history mean.
 
 ## What 40-day evaluation establishes
 

@@ -28,7 +28,8 @@
         "temperature_k": 0.5,
         "wind_ms": 1.0,
         "correlation_km": 500
-      }
+      },
+      "fast_noise_scale": 0.5
     }
   ]
 }

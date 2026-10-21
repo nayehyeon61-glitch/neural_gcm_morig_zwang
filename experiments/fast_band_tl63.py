@@ -16,7 +16,7 @@ import jax
 import numpy as np
 
 from neuralgcm_mz.rollout import ClosureController
-from noise_response_tl63 import DT, H, make_checkpoint
+from noise_response_tl63 import DT, H, make_checkpoint, unit_gain
 
 
 def main():
@@ -72,8 +72,15 @@ def main():
     }
     for scale in args.fast_scales:
         configs[f"full_corr_s{scale:g}"] = dict(gain=1., slow=True, noise_fn=correlated, fast_scale=scale)
+    gains = {}
     for name, spec in configs.items():
-        controller = ClosureController(make_checkpoint(sigma, gain=spec["gain"], slow=spec["slow"]), history,
+        checkpoint = make_checkpoint(sigma, gain=spec["gain"], slow=spec["slow"])
+        if spec["gain"] > 0:
+            key = spec["noise_fn"] is None
+            if key not in gains:
+                gains[key] = unit_gain(make_checkpoint(sigma, gain=1., slow=False), history, spec["noise_fn"])
+            checkpoint["noise_model"]["diffusion_gain"] = gains[key]
+        controller = ClosureController(checkpoint, history,
                                        np.zeros_like(history), seed=11, mode="noise", correction_scale=1.,
                                        tendency_clip_std=5., tile_columns=4096, noise_fn=spec["noise_fn"],
                                        memory_limit_gb=16, fast_noise_scale=spec.get("fast_scale", 1.))

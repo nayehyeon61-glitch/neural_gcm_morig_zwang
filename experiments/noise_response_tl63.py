@@ -26,6 +26,7 @@ import numpy as np
 from neuralgcm_mz.closure import init_closure
 from neuralgcm_mz.diffusion import init_denoiser
 from neuralgcm_mz.rollout import ClosureController
+from neuralgcm_mz.spectral import dct
 
 H, K = 4, 8
 DT = 6 * 3600.
@@ -44,6 +45,23 @@ def make_checkpoint(channels, *, gain, slow):
             "noise_model": model,
             "normalizer": dict(state_mean=np.zeros(channels), state_std=np.full(channels, 50.),
                                residual_mean=np.zeros(channels), residual_std=np.full(channels, RESIDUAL_STD))}
+
+
+def unit_gain(checkpoint, history, noise_fn):
+    """Gain giving the untrained DDPM unit variance per (DCT mode, channel).
+
+    Stands in for training.calibrate_diffusion, which needs real residuals.
+    Without it the untrained sampler's output is far above the clip (5 sigma),
+    so the clip, not the configured scale, sets the forcing amplitude.
+    """
+    probe = ClosureController(checkpoint, history, np.zeros_like(history), seed=99, mode="noise",
+                              correction_scale=1., tendency_clip_std=1e30, tile_columns=4096,
+                              noise_fn=noise_fn, memory_limit_gb=16, slow_noise=False)
+    probe._new_block()
+    k, c = probe.history_block.shape[:2]
+    values = probe.history_block.reshape(k, c, -1) / RESIDUAL_STD          # [mode-time, channel, column]
+    power = np.mean(np.asarray(dct(values, axis=0))**2, axis=2)            # [mode, channel]
+    return np.where(probe.mask[:, None] > 0, 1 / np.sqrt(power), 1.).astype(np.float32)
 
 
 def main():
@@ -117,8 +135,16 @@ def main():
         results[name] = entry
         print(name, json.dumps(entry), flush=True)
 
+    gains = {}
     for name, spec in configs.items():
         checkpoint = make_checkpoint(sigma, gain=spec["gain"], slow=spec["slow"])
+        if spec["gain"] > 0:
+            key = spec["noise_fn"] is None
+            if key not in gains:
+                gains[key] = unit_gain(make_checkpoint(sigma, gain=1., slow=False), history, spec["noise_fn"])
+                print("unit gain (white)" if key else "unit gain (correlated)",
+                      f"median {np.median(gains[key][gains[key] != 1]):.3g}", flush=True)
+            checkpoint["noise_model"]["diffusion_gain"] = gains[key]
         controller = ClosureController(checkpoint, history, np.zeros_like(history), seed=11, mode="noise",
                                        correction_scale=1., tendency_clip_std=5., tile_columns=4096,
                                        noise_fn=spec["noise_fn"], memory_limit_gb=16,
