@@ -26,6 +26,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=6)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--fast-scales", nargs="*", type=float, default=[0.5])
     args = parser.parse_args()
     model = neuralgcm.PressureLevelModel.from_checkpoint(demo.load_checkpoint_tl63_stochastic())
     backend = NeuralGCMBackend(model)
@@ -69,11 +70,13 @@ def main():
         "slow_corr": dict(gain=0., slow=True, noise_fn=correlated),
         "full_corr": dict(gain=1., slow=True, noise_fn=correlated),
     }
+    for scale in args.fast_scales:
+        configs[f"full_corr_s{scale:g}"] = dict(gain=1., slow=True, noise_fn=correlated, fast_scale=scale)
     for name, spec in configs.items():
         controller = ClosureController(make_checkpoint(sigma, gain=spec["gain"], slow=spec["slow"]), history,
                                        np.zeros_like(history), seed=11, mode="noise", correction_scale=1.,
                                        tendency_clip_std=5., tile_columns=4096, noise_fn=spec["noise_fn"],
-                                       memory_limit_gb=16)
+                                       memory_limit_gb=16, fast_noise_scale=spec.get("fast_scale", 1.))
         fast, slow = split(trajectory(controller))
         results[name] = {"fast_rms_K": wrms(fast), "fast_ratio_to_baseline": wrms(fast) / wrms(base_fast),
                          "slow_rms_diff_K": wrms(slow - base_slow)}

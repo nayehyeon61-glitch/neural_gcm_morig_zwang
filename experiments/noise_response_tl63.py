@@ -11,8 +11,10 @@ Configurations (temperature-only forcing, mode="noise", equal nominal scale):
   slow_corr     zero-frequency AR(1) branch only, 500 km correlated
   full_corr     fast_corr + slow_corr (the new default)
   ic_tiny       no forcing, 0.01 K initial perturbation (intrinsic chaos)
+  full_corr_sX  full_corr with fast_noise_scale X (--fast-scales)
 
 Usage: python experiments/noise_response_tl63.py --days 20 --output runs/noise_response.json
+       python experiments/noise_response_tl63.py --days 5 --only fast_white --fast-scales 0.25 0.5 0.75 --output ...
 """
 import argparse
 import json
@@ -51,6 +53,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=20)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--only", nargs="*", help="run only these configurations (ic_tiny included by name)")
+    parser.add_argument("--fast-scales", nargs="*", type=float, default=[])
     args = parser.parse_args()
     model = neuralgcm.PressureLevelModel.from_checkpoint(demo.load_checkpoint_tl63_stochastic())
     backend = NeuralGCMBackend(model)
@@ -69,6 +73,10 @@ def main():
         "slow_corr": dict(gain=0., slow=True, noise_fn=correlated),
         "full_corr": dict(gain=1., slow=True, noise_fn=correlated),
     }
+    if args.only is not None:
+        configs = {name: spec for name, spec in configs.items() if name in args.only}
+    for scale in args.fast_scales:
+        configs[f"full_corr_s{scale:g}"] = dict(gain=1., slow=True, noise_fn=correlated, fast_scale=scale)
     steps = args.days * 4
     report_days = [d for d in (1, 3, 5, 10, 15, 20, 30, 40) if d <= args.days]
 
@@ -113,12 +121,14 @@ def main():
         checkpoint = make_checkpoint(sigma, gain=spec["gain"], slow=spec["slow"])
         controller = ClosureController(checkpoint, history, np.zeros_like(history), seed=11, mode="noise",
                                        correction_scale=1., tendency_clip_std=5., tile_columns=4096,
-                                       noise_fn=spec["noise_fn"], memory_limit_gb=16)
+                                       noise_fn=spec["noise_fn"], memory_limit_gb=16,
+                                       fast_noise_scale=spec.get("fast_scale", 1.))
         run, applied = trajectory(controller)
         summarize(name, run, applied)
-    tiny = backend.perturb(initial, {"temperature": 0.01 * np.asarray(correlated(jax.random.PRNGKey(5), sigma)).swapaxes(-1, -2)})
-    run, _ = trajectory(start=tiny)
-    summarize("ic_tiny", run)
+    if args.only is None or "ic_tiny" in args.only:
+        tiny = backend.perturb(initial, {"temperature": 0.01 * np.asarray(correlated(jax.random.PRNGKey(5), sigma)).swapaxes(-1, -2)})
+        run, _ = trajectory(start=tiny)
+        summarize("ic_tiny", run)
     with open(args.output, "w") as stream:
         json.dump({"days": report_days, "residual_std_K_per_s": RESIDUAL_STD, "results": results}, stream, indent=2)
 

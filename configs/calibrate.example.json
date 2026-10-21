@@ -1,0 +1,69 @@
+{
+  "run_directory": "runs/calibrate_fast_noise",
+  "fast_noise_scales": [
+    0,
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "spread_tolerance": 0.1,
+  "forecast": {
+    "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
+    "closure_checkpoint": "runs/closure.npz",
+    "era5": "/absolute/path/era5_6hour/*.nc",
+    "regrid": true,
+    "days": 5,
+    "members": 4,
+    "variables": [
+      "temperature",
+      "u",
+      "v",
+      "specific_humidity"
+    ],
+    "mode": "full",
+    "correction_scale": 0.1,
+    "tendency_clip_std": 5,
+    "tile_columns": 256,
+    "seed": 42,
+    "encoder_seed": 0,
+    "memory_limit_gb": 96,
+    "noise_correlation_km": 500,
+    "slow_noise": true,
+    "slow_noise_scale": 1.0,
+    "initial_perturbation": {
+      "temperature_k": 0.5,
+      "wind_ms": 1.0,
+      "correlation_km": 500
+    }
+  },
+  "verify": {
+    "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
+    "era5": "/absolute/path/era5_6hour/*.nc",
+    "regrid": true,
+    "climatology": "/absolute/path/train_only_pressure_climatology.npy",
+    "climatology_provenance": "Training years only; same channel and grid order as forecast.json",
+    "short_tolerance": 0,
+    "memory_limit_gb": 96
+  },
+  "cases": [
+    {
+      "issue_time": "2020-01-10T00:00:00"
+    },
+    {
+      "issue_time": "2020-01-20T00:00:00"
+    },
+    {
+      "issue_time": "2020-01-30T00:00:00"
+    },
+    {
+      "issue_time": "2020-02-09T00:00:00"
+    },
+    {
+      "issue_time": "2020-02-19T00:00:00"
+    },
+    {
+      "issue_time": "2020-03-01T00:00:00"
+    }
+  ]
+}
