@@ -3,6 +3,7 @@ spatially correlated draws, memory consistency and amplitude calibration."""
 from types import SimpleNamespace
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -262,3 +263,19 @@ def test_phase_checkpoint_needs_issue_time_and_uses_it():
                               tendency_clip_std=1e6, issue_time=np.datetime64(issue))
         means.append(run(c, 2)[1])
     assert np.all(np.isfinite(means)) and not np.allclose(means[0], means[1])  # memory sees the clock
+
+
+def test_gaussian_skip_sampler_matches_coefficient_variance():
+    from neuralgcm_mz.diffusion import sample, with_gaussian_skip
+    params = init_denoiser(jax.random.PRNGKey(3), H, C, K, 8)
+    params = jax.tree_util.tree_map(jnp.zeros_like, params)    # network contributes nothing
+    variance = np.tile(np.linspace(0.25, 4.0, K)[:, None], (1, C)).astype(np.float32)
+    params = with_gaussian_skip(params, variance, 16)
+    mask = jnp.asarray(np.r_[0., np.ones(K - 1)], jnp.float32)
+    history = jnp.zeros((4096, H, 2 * C))
+    x = np.asarray(sample(params, jax.random.PRNGKey(4), history, mask, steps=16))
+    # Few-step ancestral sampling under-disperses slightly even with the exact
+    # score (THEORY: 6-13%); the per-mode gain removes that, not a 5x error.
+    ratio = x[:, 1:].std(axis=0) / np.sqrt(variance[1:])
+    assert np.all((ratio > 0.8) & (ratio < 1.03)), ratio
+    assert np.all(x[:, 0] == 0)

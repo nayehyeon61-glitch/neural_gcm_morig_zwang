@@ -11,10 +11,12 @@ from the trained closure checkpoint. Variants:
 
   current     checkpoint DDPM (column MLP, full 8-step history), correlated draws
   mlp         column MLP, light conditioning, trained here, white draws
-  mlp_corr    the same MLP sampled with correlated draws (checkpoint length)
+  *_corr      a trained variant sampled with correlated draws (checkpoint length)
   unet        spherical U-Net, light conditioning, trained here, white draws
   unet_attn   U-Net with global self-attention at the coarsest level
   gaussian    per-(mode, channel) Gaussian, spatially white (reference)
+  base        exact Gaussian denoiser per (mode, channel), no network
+  *_skip      mlp / unet / unet_attn learning a residual on top of base
 
 Light conditioning, identical for mlp and unet: latest normalized state,
 latest normalized residual, sin/cos latitude. The comparison isolates the
@@ -35,6 +37,7 @@ Usage: python experiments/unet_denoiser_test.py --archive runs/x/archive \
 """
 import argparse
 import json
+import pickle
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -273,8 +276,13 @@ def scores(gen, real, weights, names, mask):
     """gen [S,W,N,K,C] coefficients (S members), real [W,N,K,C]; returns a dict."""
     ny, nx = weights["grid"]
     w = weights["w"]                                         # [N]
-    member = gen[0]
-    ens = np.abs(gen - real[None]).mean(0) - np.abs(gen[:, None] - gen[None]).sum((0, 1)) / (2 * len(gen) * (len(gen) - 1))
+    member = gen[0].astype(np.float32)
+    # Fair CRPS, accumulated pairwise to keep memory at a few member-sized arrays.
+    m = len(gen)
+    ens = sum(np.abs(gen[i].astype(np.float32) - real) for i in range(m)) / m
+    for i in range(m):
+        for j in range(i + 1, m):
+            ens -= np.abs(gen[i].astype(np.float32) - gen[j]) / (m * (m - 1))
     active = mask > 0
     crps = float(np.sum(ens[:, :, active] * w[None, :, None, None]) / (ens[:, :, active].size / w.size * w.sum()))
     f_gen = np.asarray(idct(member, axis=2))                 # time domain fast part [W,N,K,C]
@@ -362,21 +370,53 @@ def main():
                        lambda key: init_unet(key, sum(train_dims), k * c), 5e-4),
               "unet_attn": (lambda p, x, cc, t: unet(p, x, cc, t, (ny, nx)),
                             lambda key: init_unet(key, sum(train_dims), k * c, attention=True), 5e-4)}
+    # Gaussian skip: eps_hat = base + network, where base is the exact denoiser
+    # for independent Gaussian coefficients with the training variance. With a
+    # zero network the sampler is that Gaussian; the network only learns the
+    # departures (tails, spatial and cross-channel structure, conditioning).
+    # Without it a 128- or 96-wide bottleneck cannot even pass x_t through.
+    tc = flat_data["train"][1]
+    sigma2 = jnp.asarray(np.mean([np.mean(np.square(tc[i], dtype=np.float32), 0)
+                                  for i in range(0, len(tc), 4)], 0), jnp.float32)   # [KC]
+    abar_all = schedule(STEPS)[2]
+
+    def with_skip(model):
+        def skipped(p, x, cc, t):
+            a = abar_all[jnp.round(t * (STEPS - 1)).astype(jnp.int32)][:, None, None]
+            base = jnp.sqrt(1 - a) / (a * sigma2 + 1 - a) * x
+            return base + (0 if p is None else model(p, x, cc, t))
+        return skipped
+    for name in list(models):
+        model, init, lr = models[name]
+        models[name + "_skip"] = (with_skip(model), init, lr)
     report = {"archive": args.archive, "checkpoint": args.checkpoint, "train_windows": len(flat_data["train"][1]),
               "validation_windows": len(real), "steps": args.steps, "members": args.members,
               "fast_correlation_km": length, "variants": {}}
     trained = {}
-    for name in ("mlp", "unet", "unet_attn"):
-        if name not in args.variants and not (name == "mlp" and "mlp_corr" in args.variants):
+    for name in [n for n in models]:
+        if name not in args.variants and name + "_corr" not in args.variants:
             continue
         model, init, lr = models[name]
         params = init(jax.random.PRNGKey(7))
         count = int(sum(np.size(x) for x in jax.tree_util.tree_leaves(params)))
-        params, best, trace = train(name, model, params, flat_data, m, args.steps, lr, 2, 11)
+        saved = work / f"params_{name}_{args.steps}.pkl"  # our own scratch file
+        if saved.exists():
+            with open(saved, "rb") as stream:
+                params, best, trace = pickle.load(stream)
+        else:
+            params, best, trace = train(name, model, params, flat_data, m, args.steps, lr, 2, 11)
+            with open(saved, "wb") as stream:
+                pickle.dump((jax.device_get(params), best, trace), stream)
         trained[name] = (model, params)
         report["variants"][name] = {"parameters": count, "eps_mse": best, "trace": trace}
-        if name == "mlp":
-            report["variants"]["mlp_corr"] = {"parameters": count, "eps_mse": best}
+        if name + "_corr" in args.variants:
+            report["variants"][name + "_corr"] = {"parameters": count, "eps_mse": best}
+    if "base" in args.variants:
+        evaluate = jax.jit(lambda key, x0, cc: loss_fn(with_skip(None), None, key, x0, cc, m))
+        vkeys = jax.random.split(jax.random.PRNGKey(12), len(vcoeff))  # same keys as train() validation
+        report["variants"]["base"] = {"parameters": 0, "eps_mse": float(np.mean([
+            float(evaluate(vkeys[i], jnp.asarray(vcoeff[i:i+1], jnp.float32), jnp.asarray(vcond[i:i+1], jnp.float32)))
+            for i in range(len(vcoeff))]))}
 
     full_history = np.load(work / "validation_history.npy")
     cp = checkpoint["diffusion_params"]
@@ -386,26 +426,32 @@ def main():
     for name in args.variants:
         start = time.time()
         if name == "gaussian":
-            std = np.sqrt(np.average(real[gain_half] ** 2, axis=(0, 1), weights=None))
-            gen = np.random.default_rng(5).standard_normal((args.members,) + real.shape).astype(np.float32) * std
+            std = np.sqrt(np.mean(np.square(real[gain_half]), axis=(0, 1)))
+            rng = np.random.default_rng(5)
+            gen = np.zeros((args.members,) + real.shape, np.float16)
+            for s_ in range(args.members):
+                gen[s_] = rng.standard_normal(real.shape, np.float32) * std
         else:
-            if name == "current":
+            if name == "base":   # Gaussian-skip denoiser with no network
+                model, params, draw, conds = with_skip(None), None, white, vcond
+            elif name == "current":
                 model, params, draw = current, cp, corr_draw
                 conds = full_history
             else:
-                model, params = trained["mlp" if name == "mlp_corr" else name]
-                draw = corr_draw if name == "mlp_corr" else white
+                model, params = trained[name.removesuffix("_corr")]
+                draw = corr_draw if name.endswith("_corr") else white
                 conds = vcond
-            run = jax.jit(lambda key, cc: sample(model, params, key, cc, m, (args.members, ny * nx, k * c), draw))
-            gen = np.stack([np.asarray(run(jax.random.PRNGKey(100 + i),
-                                           jnp.broadcast_to(jnp.asarray(conds[i:i+1], jnp.float32),
-                                                            (args.members,) + conds.shape[1:])))
-                            for i in range(len(real))], 1)          # [S,W,N,KC]
+            run = jax.jit(lambda key, cc: sample(model, params, key, cc, m, (1, ny * nx, k * c), draw))
+            gen = np.zeros((args.members,) + real.shape, np.float16)  # [S,W,N,KC]
+            for i in range(len(real)):
+                cc = jnp.asarray(conds[i:i+1], jnp.float32)
+                for s_ in range(args.members):
+                    gen[s_, i] = np.asarray(run(jax.random.PRNGKey(1000 * s_ + i), cc))[0]
         # Amplitude gain per (mode, channel) on half the windows, as in training.
-        sg = np.sqrt(np.mean(gen[:, gain_half] ** 2, axis=(0, 1, 2)))
+        sg = np.sqrt(np.mean(np.square(gen[:, gain_half], dtype=np.float32), axis=(0, 1, 2)))
         sr = np.sqrt(np.mean(real[gain_half] ** 2, axis=(0, 1)))
         gain = np.where(sg > 0, sr / np.maximum(sg, 1e-12), 1.0)
-        gen = gen * gain
+        gen = (gen * gain.astype(np.float16)).astype(np.float16)
         held = ~gain_half
         shape5 = lambda x: x.reshape(x.shape[:-1] + (k, c))
         result = scores(shape5(gen[:, held]), shape5(real[held]), weights, names, mask)

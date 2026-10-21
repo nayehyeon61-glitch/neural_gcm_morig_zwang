@@ -37,6 +37,7 @@ class TrainingConfig:
     calibration_batches: int = 16
     slow_noise_batches: int = 64
     correlation_origins: int = 8
+    gaussian_skip: bool = True
     phase_features: bool = False
 
     def __post_init__(self):
@@ -50,8 +51,8 @@ class TrainingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if not isinstance(self.phase_features, bool):
-            raise ValueError("phase_features must be true or false")
+        if not isinstance(self.phase_features, bool) or not isinstance(self.gaussian_skip, bool):
+            raise ValueError("phase_features and gaussian_skip must be true or false")
         if self.diffusion_steps < 2 or self.block_steps < 2:
             raise ValueError("diffusion_steps and block_steps must be at least 2")
         for name in ("dt_hours", "max_period_hours", "learning_rate", "gradient_clip", "memory_limit_gb"):
@@ -385,7 +386,7 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     import optax
     from .closure import init_closure, predict_closure
     from .data import ResidualArchive
-    from .diffusion import init_denoiser, diffusion_loss
+    from .diffusion import init_denoiser, diffusion_loss, with_gaussian_skip
     from .spectral import dct, highpass_mask
 
     config = config or TrainingConfig()
@@ -469,6 +470,11 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     diffusion_eval = jax.jit(ddpm_loss)
     validation_coeff = [(h, innovation_coefficients(h, t)) for h, t in validation]
     validation_keys = jax.random.split(jax.random.PRNGKey(config.seed + 2), len(validation))
+    if config.gaussian_skip:
+        variance = np.mean([np.mean(np.square(np.asarray(innovation_coefficients(*sample_batch(
+            archive, train_origins, config, normalizer, rng)))), axis=0)
+            for _ in range(config.calibration_batches)], axis=0)
+        diffusion_params = with_gaussian_skip(diffusion_params, variance, config.diffusion_steps)
     state = optimizer.init(diffusion_params)
     best_value = float("inf")
     best_diffusion = diffusion_params

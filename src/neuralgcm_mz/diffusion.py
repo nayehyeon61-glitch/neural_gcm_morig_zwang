@@ -31,6 +31,21 @@ def init_denoiser(key, history_steps, channels, block_steps, hidden=128, extra=0
     }
 
 
+def with_gaussian_skip(params, coefficient_variance, steps):
+    """Add the exact Gaussian denoiser as a fixed skip path.
+
+    For independent coefficients x0 ~ N(0, s2) the optimal noise estimate is
+    sqrt(1-abar) / (abar s2 + 1 - abar) * x_t. The MLP output is added on top,
+    so it only learns departures from that Gaussian (conditioning, tails,
+    cross-channel structure). Without the skip a 128-wide hidden layer cannot
+    carry the 8 x C noisy input through: on the small real-data test the
+    validation noise-prediction loss was 0.89, worse than this linear rule
+    alone (about 0.38), and raw samples were five times too wide.
+    """
+    return {**params, "skip_variance": jnp.asarray(coefficient_variance, jnp.float32),
+            "skip_abar": schedule(steps)[2]}
+
+
 def denoise(params, noisy, history, time):
     t = time[:, None]
     embedding = jnp.concatenate((t, t*t, jnp.sin(jnp.pi*t), jnp.cos(jnp.pi*t)), -1)
@@ -38,7 +53,13 @@ def denoise(params, noisy, history, time):
                          history.reshape((history.shape[0], -1)), embedding), -1)
     x = jax.nn.silu(x @ params["w1"] + params["b1"])
     x = jax.nn.silu(x @ params["w2"] + params["b2"])
-    return jnp.einsum("bh,hkc->bkc", x, params["w3"]) + params["b3"]
+    out = jnp.einsum("bh,hkc->bkc", x, params["w3"]) + params["b3"]
+    if "skip_variance" in params:
+        abar = jax.lax.stop_gradient(params["skip_abar"])
+        s2 = jax.lax.stop_gradient(params["skip_variance"])
+        a = abar[jnp.round(time * (abar.shape[0] - 1)).astype(jnp.int32)][:, None, None]
+        out = out + jnp.sqrt(1 - a) / (a * s2 + 1 - a) * noisy
+    return out
 
 
 def diffusion_loss(params, key, target_coeff, history, mask, steps=32):

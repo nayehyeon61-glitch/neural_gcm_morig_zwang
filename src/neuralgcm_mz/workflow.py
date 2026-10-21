@@ -382,6 +382,7 @@ def verify(config):
         config['climatology'],lead_days=metadata['lead_days'],channel_names=metadata['channel_names'],
         latitudes=np.load(output/'latitudes.npy'),latitude_weights=np.load(weight_path) if weight_path.exists() else None,
         short_tolerance=config.get('short_tolerance',0.02),
+        require_40_days=bool(config.get('require_40_days',True)),
         evaluation_split=config.get('evaluation_split','test'),
         climatology_provenance=config['climatology_provenance'],
         budget_gib=config.get('memory_limit_gb',96)*1e9/1024**3)
