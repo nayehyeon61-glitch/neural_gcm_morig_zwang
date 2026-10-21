@@ -209,6 +209,8 @@ def forecast(config):
     ens_file=np.lib.format.open_memmap(output/'ensemble.npy',mode='w+',dtype='float32',shape=out_shape)
     # Spatially correlated closure noise; 0 restores independent columns.
     correlation_km=float(config.get('noise_correlation_km',500))
+    if not np.isfinite(correlation_km) or correlation_km<0:
+        raise ValueError('noise_correlation_km must be finite and >= 0 (0 = independent columns)')
     noise_fn=backend.spherical_noise(correlation_km) if correlation_km>0 else None
     perturbation=config.get('initial_perturbation')
     if perturbation is not None:
@@ -240,7 +242,11 @@ def forecast(config):
                 'temperature':float(perturbation.get('temperature_k',0.5))*unit[:sigma],
                 'u':float(perturbation.get('wind_ms',1.0))*unit[sigma:2*sigma],
                 'v':float(perturbation.get('wind_ms',1.0))*unit[2*sigma:]})
-        states[-1]=pack_sigma(backend.sigma_fields(initial),variables)
+        # Keep the last (state, residual) pair aligned: the residual ends in
+        # the state the controller actually sees, perturbed or re-encoded.
+        field=pack_sigma(backend.sigma_fields(initial),variables)
+        residuals[-1]=residuals[-1]+(field-states[-1])/dt
+        states[-1]=field
         controller=ClosureController(checkpoint,np.stack(states),np.stack(residuals),
             seed=closure_key,correction_scale=config.get('correction_scale',0.1),
             tendency_clip_std=config.get('tendency_clip_std',5),tile_columns=config.get('tile_columns',256),
@@ -286,7 +292,10 @@ def forecast(config):
         'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
         'closure_checkpoint':str(config['closure_checkpoint']),'status':'forecast only; skill unverified'}
     metadata['noise_correlation_km']=correlation_km
-    metadata['slow_noise']=bool(config.get('slow_noise',True)) and 'slow_cholesky' in (checkpoint.get('noise_model') or {})
+    slow_scale=float(config.get('slow_noise_scale',1.0))
+    metadata['slow_noise']=(bool(config.get('slow_noise',True)) and slow_scale>0
+        and 'slow_cholesky' in (checkpoint.get('noise_model') or {}))
+    metadata['slow_noise_scale']=slow_scale
     metadata['initial_perturbation']=perturbation
     # A deterministic baseline repeated M times has no spread: ensemble-mean
     # RMSE and CRPS of the candidate then improve from averaging alone.

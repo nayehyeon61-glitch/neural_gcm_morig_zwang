@@ -218,3 +218,22 @@ def test_climatology_reads_training_period_only(tmp_path, monkeypatch):
     assert FakeReader.visited == list(range(start, stop))
     np.testing.assert_array_equal(np.load(output), np.mean(np.arange(start, stop)))
     FakeReader.max_allowed = None
+
+
+def test_forecast_rejects_negative_noise_correlation(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = None
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    monkeypatch.setattr(workflow, "ClosureController", FakeController)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
+        "channel_names": ["temperature:sigma_0"], "dt_seconds": 86400,
+        "config": {"history_steps": 2},
+        "provenance": {"neuralgcm_sha256": workflow.checkpoint_sha256(base_checkpoint)}})
+    with pytest.raises(ValueError, match="noise_correlation_km"):
+        workflow.forecast({"neuralgcm_checkpoint": str(base_checkpoint), "closure_checkpoint": "model.npz",
+                           "variables": ["temperature"], "era5": "dummy", "issue_time": "2000-01-03",
+                           "output": str(tmp_path/"forecast"), "days": 5, "members": 1,
+                           "noise_correlation_km": -500})
