@@ -141,6 +141,10 @@ def denormalize_tendency(values, normalizer):
     return values * normalizer["residual_std"] + normalizer["residual_mean"]
 
 
+TINY_STD = 1e-30
+GAIN_BOUNDS = (0.01, 5.0)
+
+
 def _stream_channel_moments(array, start: int, stop: int, chunk_steps: int):
     """Parallel/Welford moments, holding only a few time slices in memory."""
     count = 0
@@ -162,8 +166,10 @@ def _stream_channel_moments(array, start: int, stop: int, chunk_steps: int):
     if count == 0:
         raise ValueError("Training split is empty")
     std = np.sqrt(m2 / count)
-    # Constant channels remain finite without amplifying small numerical errors.
-    std = np.where(std > 1e-12, std, 1.0)
+    # Exactly constant channels get a tiny scale, never 1: generated values
+    # are multiplied back by it, and a unit fallback turned stratospheric
+    # humidity residuals (std ~1e-12 kg/kg/s) into 1 kg/kg/s tendencies.
+    std = np.where(std > 0, std, TINY_STD)
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -325,7 +331,10 @@ def calibrate_diffusion(sampler, batches, mask):
 
     A small denoiser with few reverse steps does not reproduce the target
     variance (both inflation and sampler under-dispersion occur). The gain
-    is fitted on validation windows only and clipped to [0.2, 5].
+    is fitted on validation windows only and clipped to ``GAIN_BOUNDS``. An
+    undertrained epsilon network makes the ancestral sampler over-disperse
+    by far more than 5x, so the lower bound is wide; a gain at a bound means
+    the sampler is not calibrated and is flagged in the training summary.
     """
     target_power = 0.
     sample_power = 0.
@@ -335,7 +344,7 @@ def calibrate_diffusion(sampler, batches, mask):
         sample_power = sample_power + np.sum(draw.astype(np.float64)**2, axis=0)
     active = np.asarray(mask)[:, None] > 0
     ratio = np.sqrt(target_power / np.maximum(sample_power, 1e-30))
-    gain = np.where(active, np.clip(ratio, 0.2, 5.0), 1.0)
+    gain = np.where(active, np.clip(ratio, *GAIN_BOUNDS), 1.0)
     return gain.astype(np.float32)
 
 
@@ -475,6 +484,9 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
         "closure_validation_loss": closure_validation_loss,
         "noise_calibration": {"diffusion_gain_min": float(np.min(diffusion_gain)),
                               "diffusion_gain_max": float(np.max(diffusion_gain)),
+                              "diffusion_gain_at_bound": float(np.mean(np.isclose(
+                                  diffusion_gain[np.asarray(mask) > 0], GAIN_BOUNDS[0]) | np.isclose(
+                                  diffusion_gain[np.asarray(mask) > 0], GAIN_BOUNDS[1]))),
                               "slow_phi": slow["slow_phi"],
                               "slow_std_mean": float(np.mean(slow["slow_std"])),
                               "slow_samples": slow["slow_samples"], **spatial,

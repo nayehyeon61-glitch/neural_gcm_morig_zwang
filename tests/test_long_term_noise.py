@@ -195,3 +195,24 @@ def test_calibrate_picks_gate_passing_scale_closest_to_unit_spread(tmp_path, mon
     with pytest.raises(ValueError, match="validation"):
         workflow.calibrate({"fast_noise_scales": [1.0], "run_directory": str(tmp_path / "cal2"),
                             "cases": [{"evaluation_split": "test"}]})
+
+
+def test_gain_corrects_strong_over_dispersion():
+    # An undertrained sampler can be tens of times too wide; 0.2 was too tight a floor.
+    rng = np.random.default_rng(1)
+    mask = np.array([0, 0, 1, 1, 1, 1, 1, 1], np.float32)
+    batches = [(None, rng.normal(size=(512, K, C)) * mask[None, :, None]) for _ in range(4)]
+    gain = calibrate_diffusion(lambda i, h: 30 * rng.normal(size=(512, K, C)) * mask[None, :, None], batches, mask)
+    np.testing.assert_allclose(gain[2:], 1 / 30, rtol=0.1)
+
+
+def test_tiny_and_constant_channels_keep_their_scale():
+    from neuralgcm_mz.training import _stream_channel_moments, denormalize_tendency
+    rng = np.random.default_rng(2)
+    array = np.stack([rng.normal(size=(20, 4, 5)), 1e-12 * rng.normal(size=(20, 4, 5)),
+                      np.full((20, 4, 5), 3.0)], axis=1)
+    mean, std = _stream_channel_moments(array, 0, 20, 4)
+    assert 0.5 < std[0] < 1.5 and 5e-13 < std[1] < 2e-12 and std[2] < 1e-20
+    # Unit-sized generated values stay at each channel's own size, never 1.
+    physical = denormalize_tendency(np.ones(3, np.float32), dict(residual_mean=mean, residual_std=std))
+    assert abs(physical[1] - mean[1]) < 1e-11 and abs(physical[2] - 3.0) < 1e-6
