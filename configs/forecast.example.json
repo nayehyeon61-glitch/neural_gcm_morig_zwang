@@ -1,0 +1,19 @@
+{
+  "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
+  "closure_checkpoint": "runs/closure.npz",
+  "era5": "/absolute/path/era5_6hour/*.nc",
+  "issue_time": "2020-01-10T00:00:00",
+  "evaluation_split": "validation",
+  "output": "runs/forecast_20200110",
+  "regrid": true,
+  "days": 40,
+  "members": 4,
+  "variables": ["temperature", "u", "v", "specific_humidity"],
+  "mode": "full",
+  "correction_scale": 0.1,
+  "tendency_clip_std": 5,
+  "tile_columns": 256,
+  "seed": 42,
+  "encoder_seed": 0,
+  "memory_limit_gb": 96
+}

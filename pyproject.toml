@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuralgcm-mz"
+version = "0.1.0"
+description = "Time-DCT residual diffusion and causal finite-history closure inside NeuralGCM"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy==2.2.6", "scipy>=1.14,<2", "jax==0.4.35", "jaxlib==0.4.35",
+  "dm-haiku==0.0.13", "optax==0.2.4", "chex==0.1.90", "psutil>=6,<8",
+  "xarray>=2024.11", "netCDF4>=1.7", "dask==2024.12.1"
+]
+
+[project.optional-dependencies]
+neuralgcm = ["neuralgcm==1.1.2", "dinosaur==1.2.2", "tensorflow-probability==0.25.0"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+ngcm-mz = "neuralgcm_mz.cli:main"
+ngcm-mz-workflow = "neuralgcm_mz.workflow:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

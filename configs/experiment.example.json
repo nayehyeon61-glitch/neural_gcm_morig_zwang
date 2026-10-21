@@ -1,0 +1,13 @@
+{
+  "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
+  "era5": "/absolute/path/era5_6hour/*.nc",
+  "regrid": true,
+  "memory_limit_gb": 96,
+  "run_directory": "runs/experiment_001",
+  "prepare": {"dt_hours": 6},
+  "train": {"dt_hours": 6, "history_steps": 8, "block_steps": 8, "diffusion_steps": 32, "batch_columns": 64},
+  "short_tolerance": 0.0,
+  "cases": [
+    {"issue_time": "2020-01-10T00:00:00", "days": 40, "members": 4, "correction_scale": 0.1, "evaluation_split": "validation"}
+  ]
+}

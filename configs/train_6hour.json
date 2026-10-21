@@ -1,0 +1,18 @@
+{
+  "history_steps": 8,
+  "block_steps": 8,
+  "dt_hours": 6.0,
+  "max_period_hours": 48.0,
+  "hidden": 128,
+  "diffusion_steps": 32,
+  "batch_columns": 64,
+  "closure_updates": 1000,
+  "diffusion_updates": 2000,
+  "validation_every": 50,
+  "validation_batches": 4,
+  "learning_rate": 0.001,
+  "gradient_clip": 1.0,
+  "seed": 42,
+  "memory_limit_gb": 96.0,
+  "normalization_chunk_steps": 4
+}

@@ -1,0 +1,10 @@
+{
+  "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
+  "era5": "/absolute/path/era5_6hour/*.nc",
+  "archive": "runs/era5_sigma_residuals",
+  "regrid": true,
+  "dt_hours": 6,
+  "variables": ["temperature", "u", "v", "specific_humidity"],
+  "encoder_seed": 0,
+  "memory_limit_gb": 96
+}

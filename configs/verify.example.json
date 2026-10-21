@@ -1,0 +1,11 @@
+{
+  "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
+  "era5": "/absolute/path/era5_6hour/*.nc",
+  "forecast_output": "runs/forecast_20200110",
+  "regrid": true,
+  "climatology": "/absolute/path/train_only_pressure_climatology.npy",
+  "climatology_provenance": "Training years only; same channel and grid order as forecast.json",
+  "evaluation_split": "validation",
+  "short_tolerance": 0.02,
+  "memory_limit_gb": 96
+}
