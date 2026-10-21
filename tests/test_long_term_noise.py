@@ -216,3 +216,14 @@ def test_tiny_and_constant_channels_keep_their_scale():
     # Unit-sized generated values stay at each channel's own size, never 1.
     physical = denormalize_tendency(np.ones(3, np.float32), dict(residual_mean=mean, residual_std=std))
     assert abs(physical[1] - mean[1]) < 1e-11 and abs(physical[2] - 3.0) < 1e-6
+
+
+def test_untrained_sampler_stays_bounded():
+    # A zero epsilon network used to grow ~1/sqrt(abar_T); x0 clipping bounds it.
+    import jax.numpy as jnp
+    from neuralgcm_mz.diffusion import X0_CLIP, sample
+    params = jax.tree_util.tree_map(jnp.zeros_like, init_denoiser(jax.random.PRNGKey(0), H, C, K, 8))
+    mask = jnp.asarray([0, 0, 1, 1, 1, 1, 1, 1], jnp.float32)
+    draw = np.asarray(sample(params, jax.random.PRNGKey(1), jnp.zeros((256, H, 2 * C)), mask, steps=32))
+    assert np.abs(draw).max() <= X0_CLIP + 1e-5
+    np.testing.assert_array_equal(draw[:, :2], 0)

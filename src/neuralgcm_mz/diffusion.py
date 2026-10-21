@@ -54,19 +54,30 @@ def diffusion_loss(params, key, target_coeff, history, mask, steps=32):
     return jnp.sum((predicted-noise)**2) / (jnp.sum(mask)*target_coeff.shape[0]*target_coeff.shape[2])
 
 
+X0_CLIP = 6.0
+
+
 def reverse_step(params, x, history, t, noise, mask, steps=32):
     """One ancestral DDPM step at index t, given unit Gaussian ``noise``.
 
     The caller owns the noise so that it may be spatially correlated across
     columns. Each column still receives marginally standard normal noise, so
     the per-column reverse process is unchanged.
+
+    The posterior mean is formed from the implied clean sample
+    x0 = (x - sqrt(1-abar) eps) / sqrt(abar), clipped to +-X0_CLIP (targets
+    are unit-variance DCT coefficients). Unclipped this equals the usual
+    eps form; clipped it stops an imperfect eps network from compounding
+    the 1/sqrt(alpha) growth near t = T, which drove an undertrained
+    sampler to hundreds of standard deviations.
     """
     beta, alpha, abar = schedule(steps)
     m = mask[None, :, None]
     time = jnp.full((x.shape[0],), t / (steps - 1))
     eps = denoise(params, x, history, time) * m
-    mean = (x - beta[t] / jnp.sqrt(1-abar[t]) * eps) / jnp.sqrt(alpha[t])
     previous = jnp.where(t > 0, abar[jnp.maximum(t-1, 0)], 1.)
+    x0 = jnp.clip((x - jnp.sqrt(1-abar[t]) * eps) / jnp.sqrt(abar[t]), -X0_CLIP, X0_CLIP)
+    mean = (jnp.sqrt(previous) * beta[t] * x0 + jnp.sqrt(alpha[t]) * (1-previous) * x) / (1-abar[t])
     variance = beta[t] * (1-previous) / (1-abar[t])
     return (mean + jnp.where(t > 0, jnp.sqrt(variance) * noise, 0)) * m
 
