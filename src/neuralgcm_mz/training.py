@@ -36,13 +36,14 @@ class TrainingConfig:
     normalization_chunk_steps: int = 4
     calibration_batches: int = 16
     slow_noise_batches: int = 64
+    correlation_origins: int = 8
 
     def __post_init__(self):
         positive_int = (
             "history_steps", "block_steps", "hidden", "diffusion_steps",
             "batch_columns", "closure_updates", "diffusion_updates",
             "validation_every", "validation_batches", "normalization_chunk_steps",
-            "calibration_batches", "slow_noise_batches",
+            "calibration_batches", "slow_noise_batches", "correlation_origins",
         )
         for name in positive_int:
             value = getattr(self, name)
@@ -268,6 +269,57 @@ def fit_slow_noise(archive, origins, config, normalizer, rng, innovation):
             "slow_samples": int(len(a))}
 
 
+def zonal_correlation_length(fields, latitudes, max_latitude=60.):
+    """Gaussian e-folding length (km) of zonal correlation, [sample,lat,lon,channel].
+
+    Each sample and channel is standardized over the globe. For every zonal
+    lag with correlation c in (0.05, 0.95), L = d / sqrt(-2 ln c) at that
+    lag's great-circle-chord distance d; the median over latitudes within
+    ``max_latitude`` and lags is returned. 0 means grid-scale white noise.
+    """
+    from .spatial import EARTH_RADIUS_KM
+    f = np.asarray(fields, np.float64)
+    f = (f - f.mean(axis=(1, 2), keepdims=True)) / np.maximum(f.std(axis=(1, 2), keepdims=True), 1e-12)
+    nx = f.shape[2]
+    lengths = []
+    for j, lat in enumerate(np.asarray(latitudes, np.float64)):
+        if abs(lat) > max_latitude:
+            continue
+        row = f[:, j]
+        for lag in range(1, max(2, nx // 4)):
+            c = float(np.mean(row * np.roll(row, lag, axis=1)))
+            if not 0.05 < c < 0.95:
+                if c <= 0.05:
+                    break
+                continue
+            d = EARTH_RADIUS_KM * np.cos(np.deg2rad(lat)) * 2 * np.pi * lag / nx
+            lengths.append(d / np.sqrt(-2 * np.log(c)))
+    return float(np.median(lengths)) if lengths else 0.0
+
+
+def fit_spatial_correlation(archive, origins, config, normalizer, rng, innovation, mask):
+    """Correlation lengths of the fast and block-mean innovation, from data.
+
+    The DDPM and AR(1) branches are column-wise, so their spatial structure
+    comes only from the random fields that drive them. Fitting the length
+    to training innovations replaces an arbitrary choice and sets how much
+    of the calibrated per-column variance reaches resolved scales.
+    """
+    from .spectral import dct, idct
+    ny, nx = archive.states.shape[-2:]
+    ys, xs = np.repeat(np.arange(ny), nx), np.tile(np.arange(nx), ny)
+    fast, slow = [], []
+    for _ in range(config.correlation_origins):
+        origin = origins[int(rng.integers(len(origins)))]
+        history, target = _window(archive, origin, ys, xs, config, normalizer)
+        e = np.asarray(innovation(history, target))
+        f = np.asarray(idct(dct(e, axis=1) * np.asarray(mask)[None, :, None], axis=1))
+        fast.append(f.reshape(ny, nx, *f.shape[1:]).transpose(2, 0, 1, 3))
+        slow.append(e.mean(axis=1).reshape(1, ny, nx, -1))
+    return {"correlation_km_fast": zonal_correlation_length(np.concatenate(fast), archive.latitudes),
+            "correlation_km_slow": zonal_correlation_length(np.concatenate(slow), archive.latitudes)}
+
+
 def calibrate_diffusion(sampler, batches, mask):
     """Per (mode, channel) gain matching DDPM sample spread to held-out innovations.
 
@@ -416,14 +468,16 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     innovation = jax.jit(lambda h, t: t - predict_closure(closure_params, h))
     slow = fit_slow_noise(archive, pair_origins, config, normalizer,
                           np.random.default_rng(config.seed + 5), innovation)
-    noise_model = {"version": 1, "diffusion_gain": diffusion_gain, **slow}
+    spatial = fit_spatial_correlation(archive, train_origins, config, normalizer,
+                                      np.random.default_rng(config.seed + 6), innovation, mask)
+    noise_model = {"version": 1, "diffusion_gain": diffusion_gain, **slow, **spatial}
     summary = {
         "closure_validation_loss": closure_validation_loss,
         "noise_calibration": {"diffusion_gain_min": float(np.min(diffusion_gain)),
                               "diffusion_gain_max": float(np.max(diffusion_gain)),
                               "slow_phi": slow["slow_phi"],
                               "slow_std_mean": float(np.mean(slow["slow_std"])),
-                              "slow_samples": slow["slow_samples"],
+                              "slow_samples": slow["slow_samples"], **spatial,
                               "gain_fit_split": "validation", "slow_fit_split": "train"},
         "diffusion_validation_loss": best_value,
         "normalization_fit_split": "train", "train_bounds": [start, stop],

@@ -16,7 +16,8 @@ class ClosureController:
     def __init__(self, checkpoint, states, past_corrections, *, seed=0,
                  correction_scale=0.1, tendency_clip_std=5., tile_columns=256,
                  mode="full", memory_limit_gb=96, noise_fn=None,
-                 slow_noise=True, slow_noise_scale=1.0):
+                 slow_noise=True, slow_noise_scale=1.0, fast_noise_scale=1.0,
+                 slow_noise_fn=None):
         """Histories [H,C,Y,X], ending at issue time; residuals end just before it.
 
         correction_scale is an experimental, validation-selected parameter.
@@ -24,8 +25,12 @@ class ClosureController:
         per column/channel bounds the whole time block, preserving the fast
         component's spectral support. This is not a conservation law.
 
-        ``noise_fn(key, n) -> [n,Y,X]`` supplies unit-variance fields for all
-        stochastic draws (see ``spatial.py``); the default is spatially white.
+        ``noise_fn(key, n) -> [n,Y,X]`` supplies unit-variance fields for the
+        fast DDPM draws and ``slow_noise_fn`` for the AR(1) shocks (default:
+        ``noise_fn``); see ``spatial.py``. The default is spatially white.
+        ``fast_noise_scale`` and ``slow_noise_scale`` set each branch's
+        amplitude relative to its calibrated statistics; select them on
+        validation rollouts (``workflow calibrate``).
         ``slow_noise`` enables the zero-frequency AR(1) branch when the
         checkpoint carries its fitted statistics. Modes: ``full`` (mean, fast
         and slow noise), ``memory`` (mean only), ``noise`` (noise only, the
@@ -36,8 +41,9 @@ class ClosureController:
             raise ValueError("Invalid correction strength, tendency bound, or tile size")
         if mode not in {"full", "memory", "noise", "off"}:
             raise ValueError("mode must be full, memory, noise, or off")
-        if not np.isfinite(slow_noise_scale) or slow_noise_scale < 0:
-            raise ValueError("slow_noise_scale must be finite and nonnegative")
+        for name, value in (("slow_noise_scale", slow_noise_scale), ("fast_noise_scale", fast_noise_scale)):
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
         self.checkpoint = checkpoint
         self.config = checkpoint["config"]
         self.h = self.config["history_steps"]
@@ -59,6 +65,8 @@ class ClosureController:
             future_steps=self.config['block_steps'],model_bytes=check_process_memory(self.memory_gib),
             budget_gib=self.memory_gib)
         self.noise_fn = noise_fn or independent_noise(y, x)
+        self.slow_noise_fn = slow_noise_fn or self.noise_fn
+        self.fast_scale = float(fast_noise_scale)
         k = self.config["block_steps"]
         noise_model = checkpoint.get("noise_model") or {}
         self.gain = np.asarray(noise_model.get("diffusion_gain", np.ones((k, c))), np.float32)
@@ -81,10 +89,10 @@ class ClosureController:
         self._reverse = jax.jit(lambda p, xt, h, t, z: reverse_step(p, xt, h, t, z, self.mask, steps))
         self._mean = jax.jit(predict_closure)
 
-    def _fields(self, key, n):
+    def _fields(self, key, n, fn=None):
         """[n,Y,X] unit fields -> column layout [Y*X, n]."""
         c, y, x = self.shape
-        return jnp.asarray(self.noise_fn(key, n)).reshape(n, y*x).T
+        return jnp.asarray((fn or self.noise_fn)(key, n)).reshape(n, y*x).T
 
     def _fast_noise(self, key, context):
         """Reverse DDPM over all columns, with column-correlated Gaussian draws."""
@@ -107,7 +115,7 @@ class ClosureController:
     def _slow_noise(self, key):
         """Block-constant zero-frequency innovation, AR(1) across blocks."""
         c, y, x = self.shape
-        shock = self._fields(key, c) @ self.slow_cholesky.T
+        shock = self._fields(key, c, self.slow_noise_fn) @ self.slow_cholesky.T
         if self.slow_state is None:
             self.slow_state = shock
         else:
@@ -129,7 +137,8 @@ class ClosureController:
                 mean[left:right] = np.asarray(self._mean(self.checkpoint["closure_params"],context[left:right]))
         noise = np.zeros_like(mean)
         if self.mode in {"full", "noise"}:
-            noise = self._fast_noise(fast_key, context)
+            noise = (self._fast_noise(fast_key, context) * self.fast_scale if self.fast_scale > 0
+                     else jnp.zeros_like(mean))
             if self.slow_enabled:
                 noise = noise + self._slow_noise(slow_key)
             noise = np.asarray(noise)

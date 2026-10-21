@@ -149,3 +149,49 @@ def test_spectral_filter_and_spherical_noise_unit_variance():
     neighbour = np.mean(fields[:, :, 1:] * fields[:, :, :-1])
     white = np.asarray(independent_noise(lat, lon)(jax.random.PRNGKey(1), 400))
     assert neighbour > 0.5 and abs(np.mean(white[:, :, 1:] * white[:, :, :-1])) < 0.05
+
+
+def test_fast_noise_scale_multiplies_only_the_fast_branch():
+    model = {"version": 1, "diffusion_gain": np.ones((K, C), np.float32)}
+    runs = {}
+    for scale in (0., 1., 2.):
+        c = ClosureController(checkpoint(model), np.zeros(SHAPE), np.zeros(SHAPE), mode="noise",
+                              correction_scale=1, tendency_clip_std=1e6, fast_noise_scale=scale, seed=4)
+        runs[scale] = run(c, 1 + K)
+    np.testing.assert_array_equal(runs[0.], 0)
+    np.testing.assert_allclose(runs[2.], 2 * runs[1.], rtol=1e-5, atol=1e-6)
+    slow = ClosureController(checkpoint(slow_model(0.5)), np.zeros(SHAPE), np.zeros(SHAPE), mode="noise",
+                             correction_scale=1, tendency_clip_std=1e6, fast_noise_scale=0.)
+    assert np.abs(run(slow, 1 + K)[1:]).min() > 0  # slow branch untouched by the fast scale
+
+
+def test_zonal_correlation_length_recovers_generator_length():
+    from neuralgcm_mz.training import zonal_correlation_length
+    spherical_harmonic = pytest.importorskip("dinosaur.spherical_harmonic")
+    from neuralgcm_mz.spatial import spherical_noise
+    grid = spherical_harmonic.Grid.T42()
+    lats = np.rad2deg(np.arcsin(grid.nodal_axes[1]))
+    fields = np.asarray(spherical_noise(grid, 800)(jax.random.PRNGKey(0), 64))[..., None]
+    estimate = zonal_correlation_length(fields, lats)
+    assert 500 < estimate < 1300
+    white = np.random.default_rng(0).normal(size=fields.shape)
+    assert zonal_correlation_length(white, lats) == 0.0
+
+
+def test_calibrate_picks_gate_passing_scale_closest_to_unit_spread(tmp_path, monkeypatch):
+    from neuralgcm_mz import workflow
+    def fake_forecast(config):
+        return {}
+    def fake_verify(config):
+        scale = float(config["forecast_output"].split("scale_")[1].split("/")[0])
+        ratio = 0.4 + 0.5 * scale  # spread grows with the fast-noise strength
+        return {"leads": {d: {"spread_skill_ratio": [ratio]} for d in ("1", "3", "5")},
+                "short_range_gate": {"passed": scale <= 1.0}}
+    monkeypatch.setattr(workflow, "forecast", fake_forecast)
+    monkeypatch.setattr(workflow, "verify", fake_verify)
+    result = workflow.calibrate({"fast_noise_scales": [0.25, 0.5, 1.0, 1.5], "run_directory": str(tmp_path / "cal"),
+                                 "cases": [{"issue_time": "2020-01-10"}]})
+    assert result["chosen_fast_noise_scale"] == 1.0  # ratio 0.9; 1.5 fails the gate
+    with pytest.raises(ValueError, match="validation"):
+        workflow.calibrate({"fast_noise_scales": [1.0], "run_directory": str(tmp_path / "cal2"),
+                            "cases": [{"evaluation_split": "test"}]})

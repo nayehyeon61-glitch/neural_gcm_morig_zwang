@@ -15,6 +15,7 @@ import numpy as np
 from .data import validate_timestamps, write_residual_archive, ResidualArchive
 from .resources import check_process_memory
 from .rollout import ClosureController, pack_sigma, unpack_sigma
+from .spatial import independent_noise
 from .training import load_checkpoint
 
 VARIABLES = ('temperature','u','v','specific_humidity')
@@ -208,10 +209,22 @@ def forecast(config):
     base_file=np.lib.format.open_memmap(output/'baseline.npy',mode='w+',dtype='float32',shape=out_shape)
     ens_file=np.lib.format.open_memmap(output/'ensemble.npy',mode='w+',dtype='float32',shape=out_shape)
     # Spatially correlated closure noise; 0 restores independent columns.
-    correlation_km=float(config.get('noise_correlation_km',500))
-    if not np.isfinite(correlation_km) or correlation_km<0:
-        raise ValueError('noise_correlation_km must be finite and >= 0 (0 = independent columns)')
+    # Default: lengths fitted to the training innovations, else 500 km.
+    fitted=checkpoint.get('noise_model') or {}
+    correlation_km=float(config.get('noise_correlation_km',fitted.get('correlation_km_fast',500)))
+    slow_correlation_km=float(config.get('slow_noise_correlation_km',config.get('noise_correlation_km',
+                                         fitted.get('correlation_km_slow',500))))
+    for name,value in (('noise_correlation_km',correlation_km),('slow_noise_correlation_km',slow_correlation_km)):
+        if not np.isfinite(value) or value<0:
+            raise ValueError(f'{name} must be finite and >= 0 (0 = independent columns)')
     noise_fn=backend.spherical_noise(correlation_km) if correlation_km>0 else None
+    if slow_correlation_km==correlation_km:
+        slow_noise_fn=noise_fn
+    elif slow_correlation_km>0:
+        slow_noise_fn=backend.spherical_noise(slow_correlation_km)
+    else:
+        _,lon,lat=backend.sigma_shape
+        slow_noise_fn=independent_noise(lat,lon)
     perturbation=config.get('initial_perturbation')
     if perturbation is not None:
         unknown=set(perturbation)-{'temperature_k','wind_ms','correlation_km'}
@@ -252,7 +265,8 @@ def forecast(config):
             tendency_clip_std=config.get('tendency_clip_std',5),tile_columns=config.get('tile_columns',256),
             mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96),
             noise_fn=noise_fn,slow_noise=config.get('slow_noise',True),
-            slow_noise_scale=config.get('slow_noise_scale',1.0))
+            slow_noise_scale=config.get('slow_noise_scale',1.0),
+            fast_noise_scale=config.get('fast_noise_scale',1.0),slow_noise_fn=slow_noise_fn)
         base=initial; corrected=initial
         for step in range(round(days*86400/dt)):
             check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
@@ -292,6 +306,8 @@ def forecast(config):
         'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
         'closure_checkpoint':str(config['closure_checkpoint']),'status':'forecast only; skill unverified'}
     metadata['noise_correlation_km']=correlation_km
+    metadata['slow_noise_correlation_km']=slow_correlation_km
+    metadata['fast_noise_scale']=float(config.get('fast_noise_scale',1.0))
     slow_scale=float(config.get('slow_noise_scale',1.0))
     metadata['slow_noise']=(bool(config.get('slow_noise',True)) and slow_scale>0
         and 'slow_cholesky' in (checkpoint.get('noise_model') or {}))
@@ -377,6 +393,48 @@ def climatology(config):
     return metadata
 
 
+def calibrate(config):
+    """Choose the fast-noise strength on validation cases only.
+
+    For each candidate ``fast_noise_scales`` value every case is forecast and
+    verified. A candidate is admissible when every case passes the day 1/3/5
+    RMSE gate; among those, the one whose median day-1..5 spread/skill ratio
+    is closest to 1 (from below preferred: ratio <= 1 + tolerance) wins.
+    Falls back to 0 (no fast noise) when none is admissible. The test split
+    is never used; freeze the result before held-out evaluation.
+    """
+    scales=[float(v) for v in config['fast_noise_scales']]
+    if not scales or any((not np.isfinite(v)) or v<0 for v in scales):
+        raise ValueError('fast_noise_scales must be a nonempty list of nonnegative numbers')
+    root=Path(config['run_directory']); root.mkdir(parents=True,exist_ok=False)
+    tolerance=float(config.get('spread_tolerance',0.1))
+    rows=[]
+    for scale in scales:
+        reports=[]
+        for i,case in enumerate(config['cases']):
+            if case.get('evaluation_split','validation')!='validation':
+                raise ValueError('Calibration uses validation cases only')
+            out=root/f'scale_{scale:g}'/f'case_{i:03d}'
+            out.parent.mkdir(parents=True,exist_ok=True)
+            forecast({**config.get('forecast',{}),**case,'fast_noise_scale':scale,
+                      'evaluation_split':'validation','output':str(out)})
+            reports.append(verify({**config.get('verify',{}),'forecast_output':str(out),
+                                   'evaluation_split':'validation'}))
+        ratios=[x for r in reports for day in ('1','3','5')
+                for x in (r['leads'].get(day,{}).get('spread_skill_ratio') or []) if x is not None]
+        ratio=float(np.median(ratios)) if ratios else float('nan')
+        rows.append({'fast_noise_scale':scale,'short_range_gate':all(r['short_range_gate']['passed'] for r in reports),
+                     'median_spread_skill_day1_5':ratio})
+    admissible=[r for r in rows if r['short_range_gate'] and np.isfinite(r['median_spread_skill_day1_5'])
+                and r['median_spread_skill_day1_5']<=1+tolerance]
+    chosen=min(admissible,key=lambda r:abs(r['median_spread_skill_day1_5']-1))['fast_noise_scale'] if admissible else 0.0
+    result={'chosen_fast_noise_scale':chosen,'candidates':rows,'spread_tolerance':tolerance,
+            'rule':'day 1/3/5 RMSE gate on every case; spread/skill closest to 1 and <= 1+tolerance; else 0',
+            'split':'validation'}
+    write_json(root/'calibration.json',result)
+    return result
+
+
 def run(config):
     """One command for a complete, explicitly configured research experiment."""
     from .training import TrainingConfig, train
@@ -407,7 +465,7 @@ def run(config):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=['prepare','forecast','verify','climatology','run'])
+    parser.add_argument('command',choices=['prepare','forecast','verify','climatology','calibrate','run'])
     parser.add_argument('config')
     args=parser.parse_args()
     config=json.loads(Path(args.config).read_text())
