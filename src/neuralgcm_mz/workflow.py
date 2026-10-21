@@ -133,13 +133,26 @@ def prepare(config):
     truth=np.lib.format.open_memmap(temporary/'truth.npy',mode='w+',dtype='float32',shape=(n,*shape))
     predictions=np.lib.format.open_memmap(temporary/'baseline.npy',mode='w+',dtype='float32',shape=(n-1,*shape))
     rng=jax.random.PRNGKey(config.get('encoder_seed',0))
+    # warm_memory: start each interval with NeuralGCM's memory set to the
+    # state one native step earlier on the previous interval's trajectory,
+    # as mid-forecast, instead of the cold encoder memory. The cold version
+    # puts an encoding adjustment (40-53% of the 6 h residual rms on the
+    # 2.8 deg checkpoint) into the residuals that forecasts never see.
+    warm=bool(config.get('warm_memory',False))
+    previous=None
     for i in range(n):
         check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
         _,inputs,forcing=reader.record(i)
         state=backend.encode(inputs,forcing,rng_key=rng)
         truth[i]=pack_sigma(backend.sigma_fields(state),variables)
+        if warm and previous is not None:
+            state=backend.with_memory(state,previous)
         if i<n-1:
-            next_state=backend.advance_interval(state,forcing,dt)
+            if warm:
+                previous=backend.advance_interval(state,forcing,dt-backend.timestep_seconds)
+                next_state=backend.advance_interval(previous,forcing,backend.timestep_seconds)
+            else:
+                next_state=backend.advance_interval(state,forcing,dt)
             predictions[i]=pack_sigma(backend.sigma_fields(next_state),variables)
         if i%20==0: print(f'encoded interval {i}/{n-1}',flush=True)
     truth.flush(); predictions.flush()
@@ -151,7 +164,8 @@ def prepare(config):
                     'neuralgcm_sha256':checkpoint_sha256(config['neuralgcm_checkpoint']),
                     'encoder_seed':config.get('encoder_seed',0),
                     'variables':list(variables),'target':'encoded observed next state minus frozen teacher-forced next state',
-                    'forcing':'interval-start persistence','dt_seconds':dt})
+                    'forcing':'interval-start persistence','dt_seconds':dt,
+                    'memory':'warm (previous interval, one native step back)' if warm else 'cold (encoder)'})
     # Keep preparation arrays only on explicit request; they are reproducible scratch.
     if not config.get('keep_preparation',False):
         del truth,predictions
@@ -226,6 +240,17 @@ def forecast(config):
         _,lon,lat=backend.sigma_shape
         slow_noise_fn=independent_noise(lat,lon)
     perturbation=config.get('initial_perturbation')
+    # noise_scale sets the common amplitude of both noise branches and keeps
+    # their calibrated ratio, hence the residual's temporal spectrum. Scaling
+    # only the DDPM branch makes the block-constant AR(1) part dominate: in
+    # closed loop (experiments/closure_loop_check.py) fast 0.5 / slow 1 gave
+    # a 6 h autocorrelation of 0.5 inside blocks and 0.2 across them, against
+    # 0.25 in both places for the real residual.
+    common=float(config.get('noise_scale',1.0))
+    fast_scale=common*float(config.get('fast_noise_scale',1.0))
+    slow_scale=common*float(config.get('slow_noise_scale',1.0))
+    if not all(np.isfinite(v) and v>=0 for v in (common,fast_scale,slow_scale)):
+        raise ValueError('noise_scale, fast_noise_scale and slow_noise_scale must be finite and >= 0')
     if perturbation is not None:
         unknown=set(perturbation)-{'temperature_k','wind_ms','correlation_km'}
         if unknown: raise ValueError(f'Unknown initial_perturbation keys: {sorted(unknown)}')
@@ -264,9 +289,8 @@ def forecast(config):
             seed=closure_key,correction_scale=config.get('correction_scale',0.1),
             tendency_clip_std=config.get('tendency_clip_std',5),tile_columns=config.get('tile_columns',256),
             mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96),
-            noise_fn=noise_fn,slow_noise=config.get('slow_noise',True),
-            slow_noise_scale=config.get('slow_noise_scale',1.0),
-            fast_noise_scale=config.get('fast_noise_scale',1.0),slow_noise_fn=slow_noise_fn)
+            noise_fn=noise_fn,slow_noise=config.get('slow_noise',True),issue_time=issue,
+            slow_noise_scale=slow_scale,fast_noise_scale=fast_scale,slow_noise_fn=slow_noise_fn)
         base=initial; corrected=initial
         for step in range(round(days*86400/dt)):
             check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
@@ -307,8 +331,8 @@ def forecast(config):
         'closure_checkpoint':str(config['closure_checkpoint']),'status':'forecast only; skill unverified'}
     metadata['noise_correlation_km']=correlation_km
     metadata['slow_noise_correlation_km']=slow_correlation_km
-    metadata['fast_noise_scale']=float(config.get('fast_noise_scale',1.0))
-    slow_scale=float(config.get('slow_noise_scale',1.0))
+    metadata['noise_scale']=common
+    metadata['fast_noise_scale']=fast_scale
     metadata['slow_noise']=(bool(config.get('slow_noise',True)) and slow_scale>0
         and 'slow_cholesky' in (checkpoint.get('noise_model') or {}))
     metadata['slow_noise_scale']=slow_scale
@@ -394,18 +418,24 @@ def climatology(config):
 
 
 def calibrate(config):
-    """Choose the fast-noise strength on validation cases only.
+    """Choose the noise strength on validation cases only.
 
-    For each candidate ``fast_noise_scales`` value every case is forecast and
+    ``noise_scales`` scales both noise branches together (recommended: it
+    keeps the fitted temporal spectrum); the older ``fast_noise_scales``
+    scales the DDPM branch alone, for ablations.
+    For each candidate value every case is forecast and
     verified. A candidate is admissible when every case passes the day 1/3/5
     RMSE gate; among those, the one whose median day-1..5 spread/skill ratio
     is closest to 1 (from below preferred: ratio <= 1 + tolerance) wins.
     Falls back to 0 (no fast noise) when none is admissible. The test split
     is never used; freeze the result before held-out evaluation.
     """
-    scales=[float(v) for v in config['fast_noise_scales']]
+    if ('noise_scales' in config)==('fast_noise_scales' in config):
+        raise ValueError('Give exactly one of noise_scales and fast_noise_scales')
+    knob='noise_scale' if 'noise_scales' in config else 'fast_noise_scale'
+    scales=[float(v) for v in config[knob+'s']]
     if not scales or any((not np.isfinite(v)) or v<0 for v in scales):
-        raise ValueError('fast_noise_scales must be a nonempty list of nonnegative numbers')
+        raise ValueError(f'{knob}s must be a nonempty list of nonnegative numbers')
     root=Path(config['run_directory']); root.mkdir(parents=True,exist_ok=False)
     tolerance=float(config.get('spread_tolerance',0.1))
     rows=[]
@@ -416,19 +446,19 @@ def calibrate(config):
                 raise ValueError('Calibration uses validation cases only')
             out=root/f'scale_{scale:g}'/f'case_{i:03d}'
             out.parent.mkdir(parents=True,exist_ok=True)
-            forecast({**config.get('forecast',{}),**case,'fast_noise_scale':scale,
+            forecast({**config.get('forecast',{}),**case,knob:scale,
                       'evaluation_split':'validation','output':str(out)})
             reports.append(verify({**config.get('verify',{}),'forecast_output':str(out),
                                    'evaluation_split':'validation'}))
         ratios=[x for r in reports for day in ('1','3','5')
                 for x in (r['leads'].get(day,{}).get('spread_skill_ratio') or []) if x is not None]
         ratio=float(np.median(ratios)) if ratios else float('nan')
-        rows.append({'fast_noise_scale':scale,'short_range_gate':all(r['short_range_gate']['passed'] for r in reports),
+        rows.append({knob:scale,'short_range_gate':all(r['short_range_gate']['passed'] for r in reports),
                      'median_spread_skill_day1_5':ratio})
     admissible=[r for r in rows if r['short_range_gate'] and np.isfinite(r['median_spread_skill_day1_5'])
                 and r['median_spread_skill_day1_5']<=1+tolerance]
-    chosen=min(admissible,key=lambda r:abs(r['median_spread_skill_day1_5']-1))['fast_noise_scale'] if admissible else 0.0
-    result={'chosen_fast_noise_scale':chosen,'candidates':rows,'spread_tolerance':tolerance,
+    chosen=min(admissible,key=lambda r:abs(r['median_spread_skill_day1_5']-1))[knob] if admissible else 0.0
+    result={f'chosen_{knob}':chosen,'candidates':rows,'spread_tolerance':tolerance,
             'rule':'day 1/3/5 RMSE gate on every case; spread/skill closest to 1 and <= 1+tolerance; else 0',
             'split':'validation'}
     write_json(root/'calibration.json',result)

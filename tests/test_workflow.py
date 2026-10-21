@@ -83,7 +83,7 @@ class FakeBackend:
         return {"temperature": state}
     def advance_interval(self, state, forcing, dt, correction=None):
         self.forcing_times.append(forcing["time_index"])
-        return state+1+(0 if correction is None else correction["temperature"])
+        return state+dt/86400+(0 if correction is None else correction["temperature"])
     def decode(self, state, forcing):
         return {"temperature": state}
     def persisted_forcings(self, state, forcing):
@@ -91,6 +91,9 @@ class FakeBackend:
     def spherical_noise(self, length_km):
         from neuralgcm_mz.spatial import independent_noise
         return independent_noise(2, 2)
+    timestep_seconds = 3600.
+    def with_memory(self, state, previous):
+        return state + 0.5*(previous-state)  # visible memory effect for the test
 
 
 class FakeReader:
@@ -160,6 +163,27 @@ def test_prepare_produces_sigma_residuals_with_correct_units(tmp_path, monkeypat
     assert archive.manifest["residual_units"] == ["(K) s^-1"]
     assert archive.manifest["provenance"]["coordinate_system"] == "NeuralGCM native sigma nodal"
     assert archive.manifest["provenance"]["neuralgcm_sha256"] == workflow.checkpoint_sha256(base_checkpoint)
+
+
+def test_prepare_warm_memory_uses_previous_trajectory(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = None
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    path = tmp_path/"archive"
+    workflow.prepare({"neuralgcm_checkpoint": str(base_checkpoint), "variables": ["temperature"],
+                      "era5": "dummy", "archive": str(path), "dt_hours": 24, "warm_memory": True})
+    archive = ResidualArchive(path)
+    np.testing.assert_array_equal(archive.states[:, 0, 0, 0], np.arange(11))  # truth is the encoding
+    # Interval 0 has no past and stays cold. Interval 1 starts from the
+    # encoding 1 blended with the previous trajectory one native step before
+    # its end (23/24), i.e. 1 - 1/48, so its 1-day residual is 1/48 per day.
+    assert archive.residual[0, 0, 0, 0] == 0
+    np.testing.assert_allclose(archive.residual[1, 0, 0, 0], 1/48/86400, rtol=1e-5)
+    assert archive.manifest["provenance"]["memory"].startswith("warm")
+    assert len(backend.forcing_times) == 2 * 11  # two legs per interval
 
 
 def test_forecast_rejects_wrong_backbone_checkpoint_before_rollout(tmp_path, monkeypatch):

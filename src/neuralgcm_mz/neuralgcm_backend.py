@@ -206,6 +206,17 @@ class NeuralGCMBackend:
         modal = self._modal_compiled(state, tendencies_si)
         return self._step_compiled(self.model.params, state, forcings, modal)
 
+    def with_memory(self, state, previous):
+        """``state`` with NeuralGCM's memory taken from ``previous``.
+
+        ``encode`` sets the memory to the encoded state itself (no past), so
+        the first steps after an encoding carry an adjustment that a running
+        forecast does not have. Supplying the model state one native step
+        earlier reproduces the mid-forecast memory.
+        """
+        import dataclasses
+        return dataclasses.replace(state, memory=previous.state)
+
     def persisted_forcings(self, state, forcings):
         """Reuse supplied boundary values at the current physical time.
 

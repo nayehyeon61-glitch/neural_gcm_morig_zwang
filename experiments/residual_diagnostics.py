@@ -50,6 +50,8 @@ def main():
     mask = np.asarray(highpass_mask(k, config["dt_hours"], config["max_period_hours"]))
     params = checkpoint["closure_params"]
     mean_fn = jax.jit(lambda hist: predict_closure(params, hist))
+    window_config = type("C", (), {"history_steps": h, "block_steps": k,
+                                   "phase_features": config.get("phase_features", False)})
     origins = archive.window_origins("validation", h, k)
     # Consecutive, non-overlapping blocks: every window has a successor for block_phi.
     origins = origins[::k]
@@ -68,7 +70,7 @@ def main():
     pool = Pool()
     blocks = {}
     for origin in origins:
-        hist, target = _window(archive, origin, ys, xs, type("C", (), {"history_steps": h, "block_steps": k}),
+        hist, target = _window(archive, origin, ys, xs, window_config,
                                normalizer)
         mu = np.asarray(mean_fn(hist))
         e = target - mu                                   # [column, K, C]
@@ -76,13 +78,13 @@ def main():
         fast = np.asarray(idct(coeff * mask[None, :, None], axis=1))
         blocks[origin] = e.mean(axis=1)
         # Memory response: perturb past residuals by innovation-sized noise.
-        delta = rng.standard_normal(hist[..., c:].shape).astype(np.float32) * e.std(axis=(0, 1))[None, None]
+        delta = rng.standard_normal(hist[..., c:2 * c].shape).astype(np.float32) * e.std(axis=(0, 1))[None, None]
         perturbed = hist.copy()
-        perturbed[..., c:] += delta
+        perturbed[..., c:2 * c] += delta
         dmu = np.asarray(mean_fn(perturbed)) - mu
         pool.add("target", target); pool.add("mu", mu); pool.add("e", e); pool.add("coeff", coeff)
         pool.add("fast", fast); pool.add("dmu", dmu); pool.add("delta_rms", np.sqrt(np.mean(delta**2, axis=(0, 1))))
-        pool.add("local", np.stack([hist[:, -1, :c], hist[:, -1, c:]], axis=-1))  # latest state, latest residual
+        pool.add("local", np.stack([hist[:, -1, :c], hist[:, -1, c:2 * c]], axis=-1))  # latest state, latest residual
     t, mu, e = (np.stack(pool[n]) for n in ("target", "mu", "e"))      # [window, column, K, C]
     coeff, fast, dmu, local = (np.stack(pool[n]) for n in ("coeff", "fast", "dmu", "local"))
     delta_rms = np.mean(pool["delta_rms"], axis=0)

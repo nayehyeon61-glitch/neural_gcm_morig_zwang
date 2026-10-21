@@ -1,6 +1,6 @@
 {
   "run_directory": "runs/calibrate_fast_noise",
-  "fast_noise_scales": [
+  "noise_scales": [
     0,
     0.25,
     0.5,

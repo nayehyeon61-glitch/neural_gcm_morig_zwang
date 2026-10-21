@@ -21,7 +21,7 @@ class TrainingConfig:
     history_steps: int = 8
     block_steps: int = 8
     dt_hours: float = 6.0
-    max_period_hours: float = 48.0
+    max_period_hours: float = 96.0
     hidden: int = 128
     diffusion_steps: int = 32
     batch_columns: int = 64
@@ -37,6 +37,7 @@ class TrainingConfig:
     calibration_batches: int = 16
     slow_noise_batches: int = 64
     correlation_origins: int = 8
+    phase_features: bool = False
 
     def __post_init__(self):
         positive_int = (
@@ -49,6 +50,8 @@ class TrainingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.phase_features, bool):
+            raise ValueError("phase_features must be true or false")
         if self.diffusion_steps < 2 or self.block_steps < 2:
             raise ValueError("diffusion_steps and block_steps must be at least 2")
         for name in ("dt_hours", "max_period_hours", "learning_rate", "gradient_clip", "memory_limit_gb"):
@@ -135,6 +138,25 @@ def normalize_history(states, past_residuals, normalizer):
     state = (states - normalizer["state_mean"]) / normalizer["state_std"]
     residual = (past_residuals - normalizer["residual_mean"]) / normalizer["residual_std"]
     return np.concatenate((state, residual), axis=-1).astype(np.float32)
+
+
+PHASE_FEATURES = 2
+
+
+def solar_phase(times, longitudes_deg):
+    """Local solar time as (sin, cos), [columns, len(times), 2].
+
+    The innovation has a 24 h autocorrelation peak (diurnal model error); with
+    the phase as input the memory can predict that part instead of leaving it
+    to the noise. ``times`` are UTC datetime64 values of the history states.
+    """
+    hours = (np.asarray(times, "datetime64[s]").astype(np.int64) % 86400) / 3600.0
+    angle = 2 * np.pi * (hours[None, :] / 24.0 + np.asarray(longitudes_deg, np.float64)[:, None] / 360.0)
+    return np.stack((np.sin(angle), np.cos(angle)), axis=-1).astype(np.float32)
+
+
+def with_phase(history, times, longitudes_deg):
+    return np.concatenate((history, solar_phase(times, longitudes_deg)), axis=-1)
 
 
 def denormalize_tendency(values, normalizer):
@@ -238,6 +260,9 @@ def _window(archive, origin, ys, xs, config, normalizer):
     past = np.asarray(archive.residual[origin-h:origin][:, :, ys, xs]).transpose(2, 0, 1)
     future = np.asarray(archive.residual[origin:origin+k][:, :, ys, xs]).transpose(2, 0, 1)
     history = normalize_history(states, past, normalizer)
+    if getattr(config, "phase_features", False):
+        nx = archive.states.shape[-1]
+        history = with_phase(history, archive.timestamps[origin-h+1:origin+1], 360.0 * np.asarray(xs) / nx)
     target = ((future - normalizer["residual_mean"]) / normalizer["residual_std"]).astype(np.float32)
     if not np.isfinite(history).all() or not np.isfinite(target).all():
         raise ValueError("Selected training/validation window contains non-finite values")
@@ -381,8 +406,9 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     channels = archive.states.shape[1]
     key = jax.random.PRNGKey(config.seed)
     key, closure_key, diffusion_key = jax.random.split(key, 3)
-    closure_params = init_closure(closure_key, config.history_steps, channels, config.block_steps, config.hidden)
-    diffusion_params = init_denoiser(diffusion_key, config.history_steps, channels, config.block_steps, config.hidden)
+    extra = PHASE_FEATURES if config.phase_features else 0
+    closure_params = init_closure(closure_key, config.history_steps, channels, config.block_steps, config.hidden, extra)
+    diffusion_params = init_denoiser(diffusion_key, config.history_steps, channels, config.block_steps, config.hidden, extra)
     mask = highpass_mask(config.block_steps, config.dt_hours, config.max_period_hours)
     if not np.asarray(mask).any():
         raise ValueError("No high-frequency DCT modes selected")

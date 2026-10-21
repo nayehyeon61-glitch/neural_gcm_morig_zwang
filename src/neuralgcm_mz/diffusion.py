@@ -18,9 +18,9 @@ def schedule(steps):
     return beta, alpha, jnp.cumprod(alpha)
 
 
-def init_denoiser(key, history_steps, channels, block_steps, hidden=128):
+def init_denoiser(key, history_steps, channels, block_steps, hidden=128, extra=0):
     a, b, c = jax.random.split(key, 3)
-    inputs = (2 * history_steps + block_steps) * channels + 4
+    inputs = history_steps * (2 * channels + extra) + block_steps * channels + 4
     return {
         "w1": jax.random.normal(a, (inputs, hidden)) / jnp.sqrt(float(inputs)),
         "b1": jnp.zeros(hidden),

@@ -2,7 +2,7 @@
   "history_steps": 8,
   "block_steps": 8,
   "dt_hours": 6.0,
-  "max_period_hours": 48.0,
+  "max_period_hours": 96.0,
   "hidden": 128,
   "diffusion_steps": 32,
   "batch_columns": 64,

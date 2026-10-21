@@ -126,7 +126,8 @@ def test_calibration_gain_and_slow_fit_recover_known_statistics():
     residual = np.repeat(means, K)[:, None, None, None]
     archive = SimpleNamespace(states=np.zeros((n, 1, 1, 1)), residual=residual, latitudes=np.array([0.]))
     norm = {"state_mean": np.zeros(1), "state_std": np.ones(1), "residual_mean": np.zeros(1), "residual_std": np.ones(1)}
-    config = TrainingConfig(history_steps=K, block_steps=K, batch_columns=1, slow_noise_batches=300)
+    config = TrainingConfig(history_steps=K, block_steps=K, batch_columns=1, slow_noise_batches=300,
+                            phase_features=False)
     origins = range(K, n - 2 * K + 1, K)  # block-aligned so each target block is one AR(1) value
     fit = fit_slow_noise(archive, origins, config, norm, rng, lambda h, t: t)
     assert abs(fit["slow_phi"] - phi) < 0.12
@@ -192,6 +193,12 @@ def test_calibrate_picks_gate_passing_scale_closest_to_unit_spread(tmp_path, mon
     result = workflow.calibrate({"fast_noise_scales": [0.25, 0.5, 1.0, 1.5], "run_directory": str(tmp_path / "cal"),
                                  "cases": [{"issue_time": "2020-01-10"}]})
     assert result["chosen_fast_noise_scale"] == 1.0  # ratio 0.9; 1.5 fails the gate
+    both = workflow.calibrate({"noise_scales": [0.25, 1.0, 1.5], "run_directory": str(tmp_path / "cal3"),
+                               "cases": [{"issue_time": "2020-01-10"}]})
+    assert both["chosen_noise_scale"] == 1.0 and "noise_scale" in both["candidates"][0]
+    with pytest.raises(ValueError, match="exactly one"):
+        workflow.calibrate({"noise_scales": [1.0], "fast_noise_scales": [1.0],
+                            "run_directory": str(tmp_path / "cal4"), "cases": []})
     with pytest.raises(ValueError, match="validation"):
         workflow.calibrate({"fast_noise_scales": [1.0], "run_directory": str(tmp_path / "cal2"),
                             "cases": [{"evaluation_split": "test"}]})
@@ -227,3 +234,31 @@ def test_untrained_sampler_stays_bounded():
     draw = np.asarray(sample(params, jax.random.PRNGKey(1), jnp.zeros((256, H, 2 * C)), mask, steps=32))
     assert np.abs(draw).max() <= X0_CLIP + 1e-5
     np.testing.assert_array_equal(draw[:, :2], 0)
+
+
+def test_solar_phase_follows_local_time():
+    from neuralgcm_mz.training import solar_phase, with_phase
+    times = np.array(["2020-01-01T00", "2020-01-01T06", "2020-01-01T18"], "datetime64[h]")
+    p = solar_phase(times, [0., 90., 180.])
+    assert p.shape == (3, 3, 2)
+    np.testing.assert_allclose(p[0, 0], [0, 1], atol=1e-6)    # 00 UTC at Greenwich: local midnight
+    np.testing.assert_allclose(p[1, 0], p[0, 1], atol=1e-6)   # 90E at 00 UTC == 0E at 06 UTC
+    np.testing.assert_allclose(p[2, 2], p[1, 0], atol=1e-6)   # 180E at 18 UTC == 0E at 06 UTC (local 06)
+    np.testing.assert_allclose(np.sum(p**2, -1), 1, atol=1e-6)
+    assert with_phase(np.zeros((3, 3, 4), np.float32), times, [0., 90., 180.]).shape == (3, 3, 6)
+
+
+def test_phase_checkpoint_needs_issue_time_and_uses_it():
+    from neuralgcm_mz.training import PHASE_FEATURES
+    value = checkpoint({"version": 1, "diffusion_gain": np.zeros((K, C), np.float32)})
+    value["config"]["phase_features"] = True
+    value["closure_params"] = init_closure(jax.random.PRNGKey(0), H, C, K, 8, PHASE_FEATURES)
+    value["diffusion_params"] = init_denoiser(jax.random.PRNGKey(1), H, C, K, 8, PHASE_FEATURES)
+    with pytest.raises(ValueError, match="issue_time"):
+        ClosureController(value, np.zeros(SHAPE), np.zeros(SHAPE), mode="memory")
+    means = []
+    for issue in ("2020-01-01T00", "2020-01-01T12"):
+        c = ClosureController(value, np.zeros(SHAPE), np.zeros(SHAPE), mode="memory", correction_scale=1,
+                              tendency_clip_std=1e6, issue_time=np.datetime64(issue))
+        means.append(run(c, 2)[1])
+    assert np.all(np.isfinite(means)) and not np.allclose(means[0], means[1])  # memory sees the clock

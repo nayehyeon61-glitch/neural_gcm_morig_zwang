@@ -29,7 +29,7 @@
         "wind_ms": 1.0,
         "correlation_km": 500
       },
-      "fast_noise_scale": 0.5
+      "noise_scale": 0.5
     }
   ]
 }

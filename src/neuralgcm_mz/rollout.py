@@ -7,7 +7,7 @@ import numpy as np
 from .closure import predict_closure
 from .diffusion import reverse_step
 from .spectral import highpass_mask, idct
-from .training import normalize_history, denormalize_tendency
+from .training import normalize_history, denormalize_tendency, with_phase
 from .resources import check_process_memory, memory_preflight
 from .spatial import independent_noise
 
@@ -17,7 +17,7 @@ class ClosureController:
                  correction_scale=0.1, tendency_clip_std=5., tile_columns=256,
                  mode="full", memory_limit_gb=96, noise_fn=None,
                  slow_noise=True, slow_noise_scale=1.0, fast_noise_scale=1.0,
-                 slow_noise_fn=None):
+                 slow_noise_fn=None, issue_time=None):
         """Histories [H,C,Y,X], ending at issue time; residuals end just before it.
 
         correction_scale is an experimental, validation-selected parameter.
@@ -35,7 +35,8 @@ class ClosureController:
         checkpoint carries its fitted statistics. Modes: ``full`` (mean, fast
         and slow noise), ``memory`` (mean only), ``noise`` (noise only, the
         noise-without-memory ablation) and ``off``. ``seed`` may be an integer
-        or a JAX key.
+        or a JAX key. ``issue_time`` (UTC datetime64 of the last history
+        state) is required by checkpoints trained with ``phase_features``.
         """
         if not 0 <= correction_scale <= 1 or not np.isfinite(tendency_clip_std) or tendency_clip_std <= 0 or tile_columns < 1:
             raise ValueError("Invalid correction strength, tendency bound, or tile size")
@@ -60,6 +61,10 @@ class ClosureController:
         self.tile = tile_columns
         self.mode = mode
         self.memory_gib = memory_limit_gb * 1e9 / 1024**3
+        self.phase = bool(self.config.get("phase_features", False))
+        if self.phase and issue_time is None:
+            raise ValueError("This checkpoint conditions on solar phase; pass issue_time")
+        self.issue_time = None if issue_time is None else np.datetime64(issue_time, "s")
         c,y,x=self.shape
         memory_preflight(channels=c,latitude=y,longitude=x,history_steps=self.h,
             future_steps=self.config['block_steps'],model_bytes=check_process_memory(self.memory_gib),
@@ -127,7 +132,13 @@ class ClosureController:
         c, y, x = self.shape
         states = np.stack(self.states).transpose(2,3,0,1).reshape(y*x,self.h,c)
         past = np.stack(self.corrections).transpose(2,3,0,1).reshape(y*x,self.h,c)
-        context = jnp.asarray(normalize_history(states, past, self.checkpoint["normalizer"]))
+        context = normalize_history(states, past, self.checkpoint["normalizer"])
+        if self.phase:
+            dt = np.timedelta64(round(self.config["dt_hours"] * 3600), "s")
+            latest = self.issue_time + self.steps * dt
+            times = latest - dt * np.arange(self.h - 1, -1, -1)
+            context = with_phase(context, times, np.tile(360.0 * np.arange(x) / x, y))
+        context = jnp.asarray(context)
         k = self.config["block_steps"]
         fast_key, slow_key = jax.random.split(jax.random.fold_in(self.key, self.block_number))
         mean = np.zeros((y*x,k,c), np.float32)

@@ -23,8 +23,8 @@
   "memory_limit_gb": 96,
   "noise_correlation_km": 500,
   "slow_noise": true,
+  "noise_scale": 0.5,
   "slow_noise_scale": 1.0,
-  "fast_noise_scale": 0.5,
   "initial_perturbation": {
     "temperature_k": 0.5,
     "wind_ms": 1.0,
