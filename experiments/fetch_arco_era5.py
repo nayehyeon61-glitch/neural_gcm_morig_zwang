@@ -47,7 +47,7 @@ def main():
     parser.add_argument("--start", required=True, help="first day, inclusive")
     parser.add_argument("--stop", required=True, help="last day, exclusive")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args()
     with open(args.checkpoint, "rb") as stream:
         model = neuralgcm.PressureLevelModel.from_checkpoint(pickle.load(stream))
@@ -59,7 +59,21 @@ def main():
         raise ValueError("ARCO levels do not cover the checkpoint levels")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    regridder = None
+    source = spherical_harmonic.Grid(
+        latitude_nodes=len(latitude), longitude_nodes=len(longitude),
+        latitude_spacing=xarray_utils.infer_latitude_spacing(xr.DataArray(np.sort(latitude))),
+        longitude_offset=xarray_utils.infer_longitude_offset(xr.DataArray(longitude)))
+    regridder = horizontal_interpolation.ConservativeRegridder(source, model.data_coords.horizontal, skipna=True)
+    coords = {"level": level_hpa[levels], "latitude": latitude, "longitude": longitude}
+
+    def regridded(name, index):
+        # One variable at a time keeps the peak at a single 0.25 deg field (~150 MB).
+        values = fetch(name, index)
+        dims = ("level", "latitude", "longitude") if values.ndim == 3 else ("latitude", "longitude")
+        ds = xr.Dataset({name: (dims, values[levels] if values.ndim == 3 else values)},
+                        coords={k: coords[k] for k in dims}).sortby("latitude")
+        return xarray_utils.fill_nan_with_nearest(xarray_utils.regrid(ds, regridder)).astype(np.float32)
+
     days = np.arange(np.datetime64(args.start, "D"), np.datetime64(args.stop, "D"))
     with ThreadPoolExecutor(args.workers) as pool:
         for day in days:
@@ -70,20 +84,8 @@ def main():
             for hour in range(0, 24, 6):
                 time = np.datetime64(day, "h") + np.timedelta64(hour, "h")
                 index = int((time - EPOCH) / np.timedelta64(1, "h"))
-                fields = dict(zip(names, pool.map(lambda n: fetch(n, index), names)))
-                ds = xr.Dataset({n: (("level", "latitude", "longitude"), v[levels]) if v.ndim == 3
-                                 else (("latitude", "longitude"), v) for n, v in fields.items()},
-                                coords={"level": level_hpa[levels], "latitude": latitude,
-                                        "longitude": longitude}).sortby("latitude")
-                if regridder is None:
-                    source = spherical_harmonic.Grid(
-                        latitude_nodes=ds.sizes["latitude"], longitude_nodes=ds.sizes["longitude"],
-                        latitude_spacing=xarray_utils.infer_latitude_spacing(ds.latitude),
-                        longitude_offset=xarray_utils.infer_longitude_offset(ds.longitude))
-                    regridder = horizontal_interpolation.ConservativeRegridder(
-                        source, model.data_coords.horizontal, skipna=True)
-                ds = xarray_utils.fill_nan_with_nearest(xarray_utils.regrid(ds, regridder))
-                records.append(ds.astype(np.float32).expand_dims(time=[time.astype("datetime64[ns]")]))
+                ds = xr.merge(pool.map(lambda n: regridded(n, index), names))
+                records.append(ds.expand_dims(time=[time.astype("datetime64[ns]")]))
             xr.concat(records, "time").to_netcdf(str(path) + ".part", format="NETCDF4")
             Path(str(path) + ".part").rename(path)
             print(f"wrote {path.name}", flush=True)
