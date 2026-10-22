@@ -457,6 +457,10 @@ def calibrate(config):
     is closest to 1 (from below preferred: ratio <= 1 + tolerance) wins.
     Falls back to 0 (no fast noise) when none is admissible. The test split
     is never used; freeze the result before held-out evaluation.
+
+    Optional ``correction_scales`` (gamma) searches gamma and the noise knob
+    jointly on the same rule; gamma 0 is NeuralGCM alone and is run once.
+    The fallback is then gamma 0 and noise 0 (no correction).
     """
     if ('noise_scales' in config)==('fast_noise_scales' in config):
         raise ValueError('Give exactly one of noise_scales and fast_noise_scales')
@@ -464,31 +468,40 @@ def calibrate(config):
     scales=[float(v) for v in config[knob+'s']]
     if not scales or any((not np.isfinite(v)) or v<0 for v in scales):
         raise ValueError(f'{knob}s must be a nonempty list of nonnegative numbers')
+    joint='correction_scales' in config
+    gammas=[float(v) for v in config['correction_scales']] if joint else [None]
+    if joint and (not gammas or any((not np.isfinite(v)) or not 0<=v<=1 for v in gammas)):
+        raise ValueError('correction_scales must be a nonempty list of numbers in [0, 1]')
+    grid=[(g,s) for g in gammas for s in ([0.0] if g==0 else scales)]
     root=Path(config['run_directory']); root.mkdir(parents=True,exist_ok=False)
     tolerance=float(config.get('spread_tolerance',0.1))
     rows=[]
-    for scale in scales:
+    for gamma,scale in grid:
         reports=[]
+        name=f'scale_{scale:g}' if gamma is None else f'gamma_{gamma:g}_scale_{scale:g}'
+        settings={knob:scale} if gamma is None else {knob:scale,'correction_scale':gamma}
         for i,case in enumerate(config['cases']):
             if case.get('evaluation_split','validation')!='validation':
                 raise ValueError('Calibration uses validation cases only')
-            out=root/f'scale_{scale:g}'/f'case_{i:03d}'
+            out=root/name/f'case_{i:03d}'
             out.parent.mkdir(parents=True,exist_ok=True)
-            forecast({**config.get('forecast',{}),**case,knob:scale,
+            forecast({**config.get('forecast',{}),**case,**settings,
                       'evaluation_split':'validation','output':str(out)})
             reports.append(verify({**config.get('verify',{}),'forecast_output':str(out),
                                    'evaluation_split':'validation'}))
         ratios=[x for r in reports for day in ('1','3','5')
                 for x in (r['leads'].get(day,{}).get('spread_skill_ratio') or []) if x is not None]
         ratio=float(np.median(ratios)) if ratios else float('nan')
-        rows.append({knob:scale,'short_range_gate':all(r['short_range_gate']['passed'] for r in reports),
+        rows.append({**settings,'short_range_gate':all(r['short_range_gate']['passed'] for r in reports),
                      'median_spread_skill_day1_5':ratio})
     admissible=[r for r in rows if r['short_range_gate'] and np.isfinite(r['median_spread_skill_day1_5'])
                 and r['median_spread_skill_day1_5']<=1+tolerance]
-    chosen=min(admissible,key=lambda r:abs(r['median_spread_skill_day1_5']-1))[knob] if admissible else 0.0
-    result={f'chosen_{knob}':chosen,'candidates':rows,'spread_tolerance':tolerance,
+    best=min(admissible,key=lambda r:abs(r['median_spread_skill_day1_5']-1)) if admissible else None
+    result={f'chosen_{knob}':best[knob] if best else 0.0,'candidates':rows,'spread_tolerance':tolerance,
             'rule':'day 1/3/5 RMSE gate on every case; spread/skill closest to 1 and <= 1+tolerance; else 0',
             'split':'validation'}
+    if joint:
+        result['chosen_correction_scale']=best['correction_scale'] if best else 0.0
     write_json(root/'calibration.json',result)
     return result
 

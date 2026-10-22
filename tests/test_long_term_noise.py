@@ -205,6 +205,29 @@ def test_calibrate_picks_gate_passing_scale_closest_to_unit_spread(tmp_path, mon
                             "cases": [{"evaluation_split": "test"}]})
 
 
+def test_calibrate_searches_correction_and_noise_jointly(tmp_path, monkeypatch):
+    from neuralgcm_mz import workflow
+    runs = []
+    def fake_forecast(config):
+        runs.append((config["correction_scale"], config["noise_scale"]))
+        return {}
+    def fake_verify(config):
+        name = config["forecast_output"].split("/")[-2]           # gamma_<g>_scale_<s>
+        gamma, scale = float(name.split("_")[1]), float(name.split("_")[3])
+        ratio = 0.3 + 0.6 * scale * gamma
+        return {"leads": {d: {"spread_skill_ratio": [ratio]} for d in ("1", "3", "5")},
+                "short_range_gate": {"passed": gamma <= 0.5}}   # full correction hurts RMSE
+    monkeypatch.setattr(workflow, "forecast", fake_forecast)
+    monkeypatch.setattr(workflow, "verify", fake_verify)
+    result = workflow.calibrate({"noise_scales": [0.5, 1.0], "correction_scales": [0, 0.5, 1.0],
+                                 "run_directory": str(tmp_path / "cal"), "cases": [{"issue_time": "2020-01-10"}]})
+    assert runs == [(0.0, 0.0), (0.5, 0.5), (0.5, 1.0), (1.0, 0.5), (1.0, 1.0)]  # gamma 0 run once
+    assert (result["chosen_correction_scale"], result["chosen_noise_scale"]) == (0.5, 1.0)
+    with pytest.raises(ValueError, match="correction_scales"):
+        workflow.calibrate({"noise_scales": [1.0], "correction_scales": [1.5],
+                            "run_directory": str(tmp_path / "cal2"), "cases": []})
+
+
 def test_gain_corrects_strong_over_dispersion():
     # An undertrained sampler can be tens of times too wide; 0.2 was too tight a floor.
     rng = np.random.default_rng(1)

@@ -7,6 +7,13 @@
     0.75,
     1.0
   ],
+  "correction_scales": [
+    0,
+    0.1,
+    0.25,
+    0.5,
+    1.0
+  ],
   "spread_tolerance": 0.1,
   "forecast": {
     "neuralgcm_checkpoint": "/absolute/path/deterministic_2_8_deg.pkl",
