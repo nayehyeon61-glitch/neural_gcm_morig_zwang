@@ -48,6 +48,11 @@ def lag_corr(x, w, lags):
     return out
 
 
+def excess_kurtosis(x):
+    x = x - x.mean(axis=(0, 1))
+    return float(np.mean(x**4) / np.mean(x**2)**2 - 3)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True)
@@ -55,6 +60,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--fast-noise-scale", type=float, default=0.5)
     parser.add_argument("--slow-noise-scale", type=float, default=1.0)
+    parser.add_argument("--overlap-steps", type=int, default=0)
     parser.add_argument("--correlation-km", type=float, default=500.)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -64,7 +70,8 @@ def main():
     h, k = config["history_steps"], config["block_steps"]
     first, last = archive.manifest["splits"]["validation"]
     origin = first + h            # history states origin-h+1..origin, residuals origin-h..origin-1
-    steps = (last - 1 - origin) // k * k
+    stride = k - args.overlap_steps            # applied steps per block
+    steps = (last - 1 - origin) // stride * stride
     _, c, ny, nx = archive.states.shape
     noise_fn = None
     if args.correlation_km > 0:
@@ -80,7 +87,8 @@ def main():
             checkpoint, np.asarray(archive.states[origin-h+1:origin+1]),
             np.asarray(archive.residual[origin-h:origin]), seed=args.seed, correction_scale=1.,
             tile_columns=2048, mode=mode, memory_limit_gb=12, noise_fn=noise_fn,
-            fast_noise_scale=args.fast_noise_scale, slow_noise_scale=args.slow_noise_scale, issue_time=archive.timestamps[origin])
+            fast_noise_scale=args.fast_noise_scale, slow_noise_scale=args.slow_noise_scale,
+            overlap_steps=args.overlap_steps, issue_time=archive.timestamps[origin])
         means, recorder = [], controller._mean
 
         def recording(params, context):
@@ -107,19 +115,22 @@ def main():
     real = to_columns(np.asarray(archive.residual[origin+1:origin+steps]))
     blocks = len(mu_full)
     # Injected noise: generated correction minus the memory mean of the same block.
-    mu_sequence = mu_full.transpose(0, 2, 1, 3).reshape(blocks * k, ny * nx, c)[:len(generated)]
+    mu_sequence = mu_full[:, :, :stride].transpose(0, 2, 1, 3).reshape(blocks * stride, ny * nx, c)[:len(generated)]
     noise = generated - mu_sequence
+    clip = 5.0                                      # controller default tendency_clip_std
+    norm_center = np.zeros(c)                       # clip acts on normalized mean + noise
     weights = np.repeat(np.cos(np.deg2rad(archive.latitudes)), nx)
     weights = (weights / weights.mean())[None, :, None]
     names = [n.split(":")[0] for n in archive.channel_names]
     groups = {v: np.array([n == v for n in names]) for v in dict.fromkeys(names)}
     lags = list(range(1, 2 * k + 1))
-    position = np.arange(len(generated)) % k        # 0 = first step of a block
+    position = np.arange(len(generated)) % stride   # 0 = first step of a block
     report = {"checkpoint": args.checkpoint, "origin_time": str(archive.timestamps[origin]),
               "steps": steps, "blocks": blocks, "fast_noise_scale": args.fast_noise_scale,
               "slow_noise_scale": args.slow_noise_scale,
               "phase_features": bool(config.get("phase_features", False)),
-              "max_period_hours": config["max_period_hours"], "variables": {}}
+              "max_period_hours": config["max_period_hours"], "overlap_steps": args.overlap_steps,
+              "variables": {}}
     for var, sel in groups.items():
         g, r, e, m = generated[..., sel], real[..., sel], noise[..., sel], mean_only[..., sel]
         rms = lambda x: float(np.sqrt(np.mean(weights * x**2)))
@@ -127,12 +138,12 @@ def main():
         def pair_corr(x, starts):
             a = x[starts] - x.mean(axis=(0, 1)); b = x[starts + 1] - x.mean(axis=(0, 1))
             return float(np.sum(weights * a * b) / np.sqrt(np.sum(weights * a * a) * np.sum(weights * b * b)))
-        inside = np.flatnonzero(position[:-1] != k - 1)
-        across = np.flatnonzero(position[:-1] == k - 1)
-        transfer = mu_full[1:, ..., sel] - mu_memory[1:, ..., sel]           # [block-1, column, K, C]
-        previous = np.stack([e[(b - 1) * k:b * k] for b in range(1, blocks)])  # noise of block b-1
+        inside = np.flatnonzero(position[:-1] != stride - 1)
+        across = np.flatnonzero(position[:-1] == stride - 1)
+        transfer = mu_full[1:, :, :stride][..., sel] - mu_memory[1:, :, :stride][..., sel]  # [block-1, column, stride, C]
+        previous = np.stack([e[(b - 1) * stride:b * stride] for b in range(1, blocks)])  # noise of block b-1
         transfer_rms = [float(np.sqrt(np.mean(weights[0] * transfer[:, :, j]**2)) / rms(previous))
-                        for j in range(k)]
+                        for j in range(stride)]
         a, b = transfer[:, :, 0], previous[:, -1]
         beta = float(np.sum(weights[0] * a * b) / np.sum(weights[0] * b * b))
         corr = float(np.sum(weights[0] * a * b) / np.sqrt(np.sum(weights[0] * a * a) * np.sum(weights[0] * b * b)))
@@ -144,7 +155,10 @@ def main():
             "boundary_corr": {"generated_inside": pair_corr(g, inside), "generated_across": pair_corr(g, across),
                               "real_inside": pair_corr(r, inside), "real_across": pair_corr(r, across)},
             "transfer_rms_by_lead": transfer_rms, "transfer_beta": beta, "transfer_corr": corr,
-            "block_rms": [rms(g[i*k:(i+1)*k]) for i in range(len(g) // k)],
+            "block_rms": [rms(g[i*stride:(i+1)*stride]) for i in range(len(g) // stride)],
+            "kurtosis": {"generated": excess_kurtosis(g), "real": excess_kurtosis(r)},
+            # Share of entries at the 5-sigma tendency clip (normalized units).
+            "clipped_fraction": float(np.mean(np.abs(g - norm_center[sel]) >= 0.999 * clip)),
         }
         print(var, json.dumps(report["variables"][var]), flush=True)
     with open(args.output, "w") as stream:

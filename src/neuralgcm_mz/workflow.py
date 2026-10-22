@@ -221,6 +221,20 @@ def forecast(config):
     out_names=[f'{v}:{level:g}hPa' for v in variables for level in plevels]
     out_shape=(1,members,round(days),len(out_names),sample_ds.sizes['latitude'],sample_ds.sizes['longitude'])
     base_file=np.lib.format.open_memmap(output/'baseline.npy',mode='w+',dtype='float32',shape=out_shape)
+    # reuse_baseline: copy the base trajectories of an earlier forecast with the
+    # same base settings instead of integrating them again (calibration scans).
+    reused=None
+    if config.get('reuse_baseline'):
+        source=Path(config['reuse_baseline'])
+        with open(source/'forecast.json') as stream: previous=json.load(stream)
+        mine={'issue_time':str(issue),'members':members,'lead_days':list(range(1,round(days)+1)),
+              'seed':config.get('seed',42),'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
+              'initial_perturbation':config.get('initial_perturbation'),'encoder_seed':config.get('encoder_seed',trained_seed)}
+        defaults={'encoder_seed':0}  # older forecast.json files did not record it
+        if any(previous.get(key,defaults.get(key))!=value for key,value in mine.items()):
+            raise ValueError('reuse_baseline forecast has different base settings')
+        reused=np.load(source/'baseline.npy',mmap_mode='r')
+        if reused.shape!=out_shape: raise ValueError('reuse_baseline shape differs')
     ens_file=np.lib.format.open_memmap(output/'ensemble.npy',mode='w+',dtype='float32',shape=out_shape)
     # Spatially correlated closure noise; 0 restores independent columns.
     # Default: lengths fitted to the training innovations, else 500 km.
@@ -298,19 +312,22 @@ def forecast(config):
             tendency_clip_std=config.get('tendency_clip_std',5),tile_columns=config.get('tile_columns',256),
             mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96),
             noise_fn=noise_fn,slow_noise=config.get('slow_noise',True),issue_time=issue,
-            slow_noise_scale=slow_scale,fast_noise_scale=fast_scale,slow_noise_fn=slow_noise_fn)
+            slow_noise_scale=slow_scale,fast_noise_scale=fast_scale,slow_noise_fn=slow_noise_fn,
+            overlap_steps=int(config.get('overlap_steps',0)))
         base=initial; corrected=initial
         for step in range(round(days*86400/dt)):
             check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
             tendency=controller.tendency()
             correction=None if not np.any(tendency) else unpack_sigma(tendency,variables,backend.sigma_shape[0])
             # The same issue-time SST/sea-ice is persisted for both trajectories.
-            base=backend.advance_interval(base,forcing,dt)
+            if reused is None:
+                base=backend.advance_interval(base,forcing,dt)
             corrected=backend.advance_interval(corrected,forcing,dt,correction)
             controller.observe_generated(pack_sigma(backend.sigma_fields(corrected),variables),tendency)
             if (step+1)%round(daily)==0:
                 day=(step+1)//round(daily)
-                b=_pressure_fields(backend.decode(base,backend.persisted_forcings(base,forcing)),variables)
+                b=(np.asarray(reused[0,member,day-1]) if reused is not None else
+                   _pressure_fields(backend.decode(base,backend.persisted_forcings(base,forcing)),variables))
                 e=_pressure_fields(backend.decode(corrected,backend.persisted_forcings(corrected,forcing)),variables)
                 if not np.isfinite(b).all() or not np.isfinite(e).all():
                     raise FloatingPointError(f'Nonfinite decoded forecast at day {day}')
@@ -332,7 +349,7 @@ def forecast(config):
         np.save(output/'latitude_weights.npy',np.polynomial.legendre.leggauss(len(latitudes))[1])
     metadata={'issue_time':str(issue),'lead_days':list(range(1,round(days)+1)),
         'channel_names':out_names,'variables':list(variables),'pressure_levels_hpa':plevels.tolist(),
-        'members':members,'forcing':'issue-time persistence; no future ERA5 conditioning',
+        'members':members,'encoder_seed':config.get('encoder_seed',trained_seed),'forcing':'issue-time persistence; no future ERA5 conditioning',
         'first_interval':'pure NeuralGCM','closure_mode':config.get('mode','full'),
         'correction_scale':config.get('correction_scale',0.1),'seed':config.get('seed',42),
         'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
@@ -340,6 +357,7 @@ def forecast(config):
     metadata['noise_correlation_km']=correlation_km
     metadata['slow_noise_correlation_km']=slow_correlation_km
     metadata['noise_scale']=common
+    metadata['overlap_steps']=int(config.get('overlap_steps',0))
     metadata['history_memory']='warm' if warm_history else 'cold'
     metadata['fast_noise_scale']=fast_scale
     metadata['slow_noise']=(bool(config.get('slow_noise',True)) and slow_scale>0

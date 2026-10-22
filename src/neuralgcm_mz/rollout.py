@@ -6,7 +6,7 @@ import numpy as np
 
 from .closure import predict_closure
 from .diffusion import reverse_step
-from .spectral import highpass_mask, idct
+from .spectral import dct, highpass_mask, idct
 from .training import normalize_history, denormalize_tendency, with_phase
 from .resources import check_process_memory, memory_preflight
 from .spatial import independent_noise
@@ -17,7 +17,7 @@ class ClosureController:
                  correction_scale=0.1, tendency_clip_std=5., tile_columns=256,
                  mode="full", memory_limit_gb=96, noise_fn=None,
                  slow_noise=True, slow_noise_scale=1.0, fast_noise_scale=1.0,
-                 slow_noise_fn=None, issue_time=None):
+                 slow_noise_fn=None, issue_time=None, overlap_steps=0):
         """Histories [H,C,Y,X], ending at issue time; residuals end just before it.
 
         correction_scale is an experimental, validation-selected parameter.
@@ -37,6 +37,15 @@ class ClosureController:
         noise-without-memory ablation) and ``off``. ``seed`` may be an integer
         or a JAX key. ``issue_time`` (UTC datetime64 of the last history
         state) is required by checkpoints trained with ``phase_features``.
+
+        ``overlap_steps`` m (0 <= m <= K/2) makes consecutive fast-noise
+        windows overlap: each new K-step DDPM window starts m steps before the
+        block boundary, its first m steps are pinned to the previous window's
+        last m steps during reverse diffusion (RePaint-style replacement), and
+        only its last K - m steps are applied. The within-window correlation
+        the DDPM learned then carries across boundaries. Blocks become K - m
+        steps long, so the memory mean is refreshed more often and the AR(1)
+        coefficient is rescaled to that stride.
         """
         if not 0 <= correction_scale <= 1 or not np.isfinite(tendency_clip_std) or tendency_clip_std <= 0 or tile_columns < 1:
             raise ValueError("Invalid correction strength, tendency bound, or tile size")
@@ -83,6 +92,13 @@ class ClosureController:
             self.slow_phi = float(noise_model["slow_phi"])
             if self.slow_cholesky.shape != (c, c) or not 0 <= self.slow_phi < 1:
                 raise ValueError("Invalid slow-noise statistics in checkpoint")
+        if not 0 <= int(overlap_steps) <= self.config["block_steps"] // 2:
+            raise ValueError("overlap_steps must be between 0 and block_steps // 2")
+        self.overlap = int(overlap_steps)
+        self.stride = self.config["block_steps"] - self.overlap
+        if self.slow_enabled:
+            self.slow_phi = self.slow_phi ** (self.stride / self.config["block_steps"])
+        self.known = None
         self.slow_state = None
         self.block = None
         self.history_block = None
@@ -93,6 +109,8 @@ class ClosureController:
         steps = self.config["diffusion_steps"]
         self._reverse = jax.jit(lambda p, xt, h, t, z: reverse_step(p, xt, h, t, z, self.mask, steps))
         self._mean = jax.jit(predict_closure)
+        from .diffusion import schedule
+        self._abar = schedule(steps)[2]
 
     def _fields(self, key, n, fn=None):
         """[n,Y,X] unit fields -> column layout [Y*X, n]."""
@@ -100,21 +118,37 @@ class ClosureController:
         return jnp.asarray((fn or self.noise_fn)(key, n)).reshape(n, y*x).T
 
     def _fast_noise(self, key, context):
-        """Reverse DDPM over all columns, with column-correlated Gaussian draws."""
+        """Reverse DDPM over all columns, with column-correlated Gaussian draws.
+
+        Returns the gain-scaled time-domain window. With overlap the first
+        ``self.overlap`` steps are pinned to the previous window's last steps.
+        """
         c, y, x = self.shape
         k = self.config["block_steps"]
         steps = self.config["diffusion_steps"]
-        keys = jax.random.split(key, steps + 1)
+        keys = jax.random.split(key, 2 * steps + 1)
         m = jnp.asarray(self.mask)[None, :, None]
         draw = lambda key: self._fields(key, k*c).reshape(y*x, k, c)
         coeff = draw(keys[0]) * m
         params = self.checkpoint["diffusion_params"]
+        abar = self._abar
+        known, n = self.known, self.overlap
+
+        def pin(coeff, t, key):
+            # Forward-noise the known steps to level t and overwrite them.
+            series = idct(coeff, axis=1)
+            noised = jnp.sqrt(abar[t]) * known + jnp.sqrt(1 - abar[t]) * draw(key)[:, :n]
+            return dct(series.at[:, :n].set(noised), axis=1) * m
         for i in range(steps):
             t = steps - 1 - i
+            if known is not None:
+                coeff = pin(coeff, t, keys[steps + 1 + i])
             z = draw(keys[i + 1])
             coeff = jnp.concatenate([
                 self._reverse(params, coeff[a:b], context[a:b], t, z[a:b])
                 for a, b in ((a, min(a + self.tile, y*x)) for a in range(0, y*x, self.tile))])
+        if n:
+            self.known = idct(coeff, axis=1)[:, k-n:]   # pre-gain, for the next window
         return idct(coeff * jnp.asarray(self.gain)[None], axis=1)
 
     def _slow_noise(self, key):
@@ -154,6 +188,10 @@ class ClosureController:
                 noise = noise + self._slow_noise(slow_key)
             noise = np.asarray(noise)
         values = mean + noise
+        if self.overlap:
+            # Apply K - m steps: memory mean from this origin, fast noise from
+            # the part of the window after the pinned overlap.
+            values = mean[:, :self.stride] + noise[:, self.overlap:]
         gain = np.minimum(1., self.clip / np.maximum(np.max(np.abs(values),axis=1,keepdims=True),1e-12))
         norm = self.checkpoint["normalizer"]
         if self.mode == "noise":
@@ -163,7 +201,7 @@ class ClosureController:
             physical = denormalize_tendency(values * gain, norm)
         if not np.isfinite(physical).all():
             raise FloatingPointError("Closure generated nonfinite tendencies")
-        physical = physical.astype(np.float32).reshape(y,x,k,c).transpose(2,3,0,1)
+        physical = physical.astype(np.float32).reshape(y,x,values.shape[1],c).transpose(2,3,0,1)
         # Memory sees the closure's own residual estimate, at the scale it was
         # trained on; only the applied forcing is multiplied by the strength.
         self.history_block = physical
@@ -175,7 +213,7 @@ class ClosureController:
         """First physical interval is always pure NeuralGCM. Call once/interval."""
         if self.steps == 0 or self.mode == "off" or self.scale == 0:
             return np.zeros(self.shape, np.float32)
-        if self.block is None or self.position == len(self.block):
+        if self.block is None or self.position == len(self.block):  # len = K - overlap
             self._new_block()
         return self.block[self.position].copy()
 

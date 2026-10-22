@@ -279,3 +279,16 @@ def test_gaussian_skip_sampler_matches_coefficient_variance():
     ratio = x[:, 1:].std(axis=0) / np.sqrt(variance[1:])
     assert np.all((ratio > 0.8) & (ratio < 1.03)), ratio
     assert np.all(x[:, 0] == 0)
+
+
+def test_overlap_pins_window_and_shortens_blocks():
+    model = {"version": 1, "diffusion_gain": np.ones((K, C), np.float32)}
+    with pytest.raises(ValueError, match="overlap_steps"):
+        ClosureController(checkpoint(model), np.zeros(SHAPE), np.zeros(SHAPE), overlap_steps=K // 2 + 1)
+    c = ClosureController(checkpoint(model), np.zeros(SHAPE), np.zeros(SHAPE), mode="noise",
+                          correction_scale=1, tendency_clip_std=1e6, overlap_steps=K // 2, seed=2)
+    out = run(c, 1 + 3 * (K // 2))
+    assert c.block.shape[0] == K // 2 and c.block_number == 3
+    assert np.all(np.isfinite(out)) and np.abs(out[1:]).min() > 0
+    # The pinned part of each new window equals the previous window's tail (pre-gain).
+    assert c.known.shape == (SHAPE[2] * SHAPE[3], K // 2, C)

@@ -187,6 +187,29 @@ def test_forecast_history_follows_archive_memory_mode(tmp_path, monkeypatch):
     assert meta["history_memory"] == "warm"
 
 
+def test_forecast_reuses_matching_baseline(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = 2
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    monkeypatch.setattr(workflow, "ClosureController", FakeController)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
+        "channel_names": ["temperature:sigma_0"], "dt_seconds": 86400, "config": {"history_steps": 2},
+        "provenance": {"neuralgcm_sha256": workflow.checkpoint_sha256(base_checkpoint)}})
+    config = {"neuralgcm_checkpoint": str(base_checkpoint), "closure_checkpoint": "model.npz",
+              "variables": ["temperature"], "era5": "dummy", "issue_time": "2000-01-03", "days": 3, "members": 1}
+    workflow.forecast({**config, "output": str(tmp_path/"a")})
+    calls = len(backend.forcing_times)
+    workflow.forecast({**config, "output": str(tmp_path/"b"), "reuse_baseline": str(tmp_path/"a")})
+    np.testing.assert_array_equal(np.load(tmp_path/"a"/"baseline.npy"), np.load(tmp_path/"b"/"baseline.npy"))
+    history = 2  # history intervals integrated before the issue time
+    assert len(backend.forcing_times) - calls == history + 3  # corrected run only
+    with pytest.raises(ValueError, match="different base settings"):
+        workflow.forecast({**config, "seed": 7, "output": str(tmp_path/"c"), "reuse_baseline": str(tmp_path/"a")})
+
+
 def test_prepare_warm_memory_uses_previous_trajectory(tmp_path, monkeypatch):
     backend = FakeBackend()
     FakeReader.max_allowed = None
