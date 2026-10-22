@@ -16,6 +16,8 @@ from the trained closure checkpoint. Variants:
   unet_attn   U-Net with global self-attention at the coarsest level
   gaussian    per-(mode, channel) Gaussian, spatially white (reference)
   base        exact Gaussian denoiser per (mode, channel), no network
+  unet3d      (2+1)-D U-Net: vertical levels as their own axis (shared 2-D
+              convolutions per level, 1-D convolutions across levels)
   *_skip      mlp / unet / unet_attn learning a residual on top of base
 
 Light conditioning, identical for mlp and unet: latest normalized state,
@@ -31,6 +33,14 @@ Scores (normalized units, area weighted, fast part in the time domain):
   vertical_corr        adjacent-level correlation
   tq_corr              same-point temperature-humidity correlation
   kurtosis, lag1_time  per variable
+
+Options: --corr-km sets the injected correlation length of *_corr variants;
+--x0-clip the sampler's clean-sample clip (inf disables it); --transform
+asinh trains and samples in y = s asinh(x / s) per channel, with s chosen so
+that the training y has no excess kurtosis, and maps samples back with sinh
+(heavy tails from a Gaussian-like diffusion target).
+Multivariate scores: variogram score (p = 0.5) over zonal, meridional,
+vertical and 6 h pairs, and the fair energy score of each field.
 
 Usage: python experiments/unet_denoiser_test.py --archive runs/x/archive \
            --checkpoint runs/x/closure.npz --work runs/x/unet_work --output runs/x/unet_test.json
@@ -58,7 +68,7 @@ STEPS = 32  # diffusion steps, as in the checkpoints
 
 # ---------------------------------------------------------------- data
 
-def build_dataset(archive, checkpoint, work):
+def build_dataset(archive, checkpoint, work, train_stride=1):
     """Full-grid conditioning and target coefficients, float16 memmaps on disk."""
     config, norm = checkpoint["config"], checkpoint["normalizer"]
     h, k = config["history_steps"], config["block_steps"]
@@ -73,8 +83,7 @@ def build_dataset(archive, checkpoint, work):
     out = {}
     for split in ("train", "validation"):
         origins = list(archive.window_origins(split, h, k))
-        if split == "validation":
-            origins = origins[::4]
+        origins = origins[::4] if split == "validation" else origins[::train_stride]
         if (work / f"{split}.done").exists():  # reuse a finished build
             out[split] = (np.load(work / f"{split}_cond.npy", mmap_mode="r"),
                           np.load(work / f"{split}_coeff.npy", mmap_mode="r"))
@@ -206,6 +215,76 @@ def unet(params, noisy, cond, t, grid):
     return apply_dense(params["head"], a).reshape(noisy.shape)
 
 
+def init_level_conv(key, n_in, n_out, scale=1.0):
+    return {"w": jax.random.normal(key, (3, n_in, n_out)) * scale / np.sqrt(3 * n_in), "b": jnp.zeros(n_out)}
+
+
+def level_conv(p, x):
+    """1-D convolution across levels, axis -2 of [B,Y,X,L,C]; edge-replicated."""
+    padded = jnp.concatenate((x[..., :1, :], x, x[..., -1:, :]), -2)
+    return sum(jnp.einsum("byxlc,cd->byxld", padded[..., i:i + x.shape[-2], :], p["w"][i]) for i in range(3)) + p["b"]
+
+
+def conv3_levels(p, x):
+    """Spatial 3x3 on the sphere, shared across levels."""
+    b, y, xx, l, c = x.shape
+    z = x.transpose(0, 3, 1, 2, 4).reshape(b * l, y, xx, c)
+    z = conv3(p, z)
+    return z.reshape(b, l, y, xx, -1).transpose(0, 2, 3, 1, 4)
+
+
+def init_res3(key, ch):
+    a, b, c, d = jax.random.split(key, 4)
+    return {"s": init_conv3(a, ch, ch), "v": init_level_conv(b, ch, ch), "s2": init_conv3(c, ch, ch, 0.1),
+            "t": dense(d, 4, ch)}
+
+
+def res3(p, x, temb):
+    h = conv3_levels(p["s"], jax.nn.silu(rms_norm(x)))
+    h = level_conv(p["v"], jax.nn.silu(rms_norm(h))) + apply_dense(p["t"], temb)[:, None, None, None]
+    return x + conv3_levels(p["s2"], jax.nn.silu(rms_norm(h)))
+
+
+def pool3(x):
+    b, y, xx, l, c = x.shape
+    return x.reshape(b, y // 2, 2, xx // 2, 2, l, c).mean((2, 4))
+
+
+def up3(x):
+    return jnp.repeat(jnp.repeat(x, 2, 1), 2, 2)
+
+
+def init_unet3d(key, n_in, n_out, widths=(24, 32, 48)):
+    keys = iter(jax.random.split(key, 12))
+    w1, w2, w3 = widths
+    return {"stem": dense(next(keys), n_in, w1), "r1": init_res3(next(keys), w1),
+            "d2": dense(next(keys), w1, w2), "r2": init_res3(next(keys), w2),
+            "d3": dense(next(keys), w2, w3), "r3": init_res3(next(keys), w3),
+            "u2": dense(next(keys), w3 + w2, w2), "r2u": init_res3(next(keys), w2),
+            "u1": dense(next(keys), w2 + w1, w1), "r1u": init_res3(next(keys), w1),
+            "head": dense(next(keys), w1, n_out, 0.01)}
+
+
+def unet3d(params, noisy, cond, t, grid, k, variables, levels):
+    """noisy [B,N,K*C] with C ordered variable-major; cond [B,N,2C+2]."""
+    ny, nx = grid
+    b = noisy.shape[0]
+    temb = embed(t)
+    x = noisy.reshape(b, ny, nx, k, variables, levels).transpose(0, 1, 2, 5, 3, 4).reshape(b, ny, nx, levels, k * variables)
+    c = variables * levels
+    per_level = lambda z: z.reshape(b, ny, nx, variables, levels).transpose(0, 1, 2, 4, 3)
+    geo = jnp.broadcast_to(cond[..., 2 * c:].reshape(b, ny, nx, 1, -1), (b, ny, nx, levels, cond.shape[-1] - 2 * c))
+    x = jnp.concatenate((x, per_level(cond[..., :c]), per_level(cond[..., c:2 * c]), geo), -1)
+    a = res3(params["r1"], apply_dense(params["stem"], x), temb)
+    m = res3(params["r2"], apply_dense(params["d2"], pool3(a)), temb)
+    z = res3(params["r3"], apply_dense(params["d3"], pool3(m)), temb)
+    m = res3(params["r2u"], apply_dense(params["u2"], jnp.concatenate((up3(z), m), -1)), temb)
+    a = res3(params["r1u"], apply_dense(params["u1"], jnp.concatenate((up3(m), a), -1)), temb)
+    out = apply_dense(params["head"], a)                       # [B,Y,X,L,K*V]
+    out = out.reshape(b, ny, nx, levels, k, variables).transpose(0, 1, 2, 4, 5, 3)
+    return out.reshape(noisy.shape)
+
+
 # ---------------------------------------------------------------- diffusion
 
 def loss_fn(model, params, key, x0, cond, m):
@@ -218,7 +297,7 @@ def loss_fn(model, params, key, x0, cond, m):
     return jnp.sum((pred - noise) ** 2) / (jnp.sum(m) * x0.shape[0] * x0.shape[1])
 
 
-def sample(model, params, key, cond, m, shape, draw):
+def sample(model, params, key, cond, m, shape, draw, clip=X0_CLIP):
     """Ancestral sampling with the repository's x0-clipped posterior mean."""
     beta, alpha, abar = schedule(STEPS)
     keys = jax.random.split(key, STEPS + 1)
@@ -227,7 +306,7 @@ def sample(model, params, key, cond, m, shape, draw):
         t = STEPS - 1 - i
         eps = model(params, x, cond, jnp.full((shape[0],), t / (STEPS - 1))) * m
         prev = abar[t - 1] if t > 0 else 1.0
-        x0 = jnp.clip((x - jnp.sqrt(1 - abar[t]) * eps) / jnp.sqrt(abar[t]), -X0_CLIP, X0_CLIP)
+        x0 = jnp.clip((x - jnp.sqrt(1 - abar[t]) * eps) / jnp.sqrt(abar[t]), -clip, clip)
         mean = (jnp.sqrt(prev) * beta[t] * x0 + jnp.sqrt(alpha[t]) * (1 - prev) * x) / (1 - abar[t])
         var = beta[t] * (1 - prev) / (1 - abar[t])
         x = (mean + (jnp.sqrt(var) * draw(keys[i + 1], shape) if t > 0 else 0)) * m
@@ -330,6 +409,72 @@ def scores(gen, real, weights, names, mask):
     return out
 
 
+def multivariate_scores(gen, real, weights, names, k, c, p=0.5):
+    """Variogram score over neighbour pairs and fair energy score, per variable.
+
+    gen [S,W,N,K,C] (float16), real [W,N,K,C] coefficients; scored on the
+    time-domain fast part. Lower is better for both.
+    """
+    ny, nx = weights["grid"]
+    wl = weights["w"].reshape(1, ny, nx, 1, 1)
+    to_field = lambda x: np.asarray(idct(np.asarray(x, np.float32), axis=2)).reshape(x.shape[0], ny, nx, k, c)
+    y = to_field(real)
+    members = [to_field(g).astype(np.float16) for g in gen]
+    groups = {v: np.flatnonzero([n.split(":")[0] == v for n in names]) for v in dict.fromkeys(n.split(":")[0] for n in names)}
+    pairs = {"zonal": lambda f: (f, np.roll(f, -1, 2)), "meridional": lambda f: (f[:, :-1], f[:, 1:]),
+             "vertical": lambda f: (f[..., :-1], f[..., 1:]), "time_6h": lambda f: (f[:, :, :, :-1], f[:, :, :, 1:])}
+    out = {}
+    for var, idx in groups.items():
+        yv = y[..., idx]
+        mv = [np.asarray(f[..., idx], np.float32) for f in members]
+        vs = {}
+        for name, split in pairs.items():
+            a, b = split(yv)
+            ww = np.broadcast_to(wl, yv.shape)
+            wa, _ = split(ww)
+            observed = np.abs(a - b) ** p
+            expected = sum(np.abs(np.subtract(*split(f))) ** p for f in mv) / len(mv)
+            vs[name] = float(np.sum(wa * (observed - expected) ** 2) / np.sum(wa))
+        sw = np.sqrt(np.broadcast_to(wl, yv.shape))
+        norm = lambda d: np.sqrt(np.sum((sw * d) ** 2, axis=(1, 2, 3, 4)) / d[0].size)   # per window
+        m = len(mv)
+        es = sum(norm(f - yv) for f in mv) / m
+        es = es - sum(norm(mv[i] - mv[j]) for i in range(m) for j in range(m) if i != j) / (2 * m * (m - 1))
+        out[var] = {"variogram": vs, "energy": float(np.mean(es))}
+    return out
+
+
+def fit_asinh_scale(coeff, mask, k, c, windows=12):
+    """Per-channel s with zero excess kurtosis of s*asinh(x/s) on training data."""
+    x = np.concatenate([np.asarray(coeff[i], np.float32).reshape(-1, k, c)[:, mask > 0]
+                        for i in range(0, len(coeff), max(1, len(coeff) // windows))])   # [n, K', C]
+    x = x.reshape(-1, c)
+    std = x.std(axis=0)
+    factors = np.array([0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 1e3])
+    best = np.empty(c)
+    for j in range(c):
+        kurt = []
+        for f in factors:
+            s_ = f * std[j]
+            yv = s_ * np.arcsinh(x[:, j] / s_)
+            yv = yv - yv.mean()
+            kurt.append(abs(np.mean(yv**4) / np.mean(yv**2)**2 - 3))
+        best[j] = factors[int(np.argmin(kurt))] * std[j]
+    return np.tile(best[None], (k, 1)).reshape(-1).astype(np.float32)   # [K*C]
+
+
+class Mapped:
+    """Array view that applies ``fn`` to every item read."""
+    def __init__(self, array, fn):
+        self.array, self.fn, self.shape = array, fn, array.shape
+
+    def __len__(self):
+        return len(self.array)
+
+    def __getitem__(self, index):
+        return self.fn(np.asarray(self.array[index], np.float32))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True)
@@ -339,23 +484,36 @@ def main():
     parser.add_argument("--steps", type=int, default=1500)
     parser.add_argument("--members", type=int, default=4)
     parser.add_argument("--variants", nargs="+", default=["current", "mlp", "mlp_corr", "unet", "unet_attn", "gaussian"])
+    parser.add_argument("--corr-km", type=float, default=None)
+    parser.add_argument("--x0-clip", type=float, default=X0_CLIP)
+    parser.add_argument("--transform", choices=["none", "asinh"], default="none")
+    parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--train-stride", type=int, default=1, help="use every n-th training window")
     args = parser.parse_args()
     archive = ResidualArchive(args.archive)
     checkpoint = load_checkpoint(args.checkpoint)
     work = Path(args.work); work.mkdir(parents=True, exist_ok=True)
-    data, mask, (ny, nx, k, c) = build_dataset(archive, checkpoint, work)
+    data, mask, (ny, nx, k, c) = build_dataset(archive, checkpoint, work, args.train_stride)
     m = jnp.asarray(np.tile(mask[:, None], (1, c)).reshape(1, 1, k * c), jnp.float32)
     flat = lambda d: (d[0], d[1].reshape(d[1].shape[0], ny * nx, k * c))
     flat_data = {s: flat(d) for s, d in data.items()}
     vcond, vcoeff = flat_data["validation"]
     real = np.asarray(vcoeff, np.float32)                        # [W,N,KC]
+    forward = inverse = lambda x: x
+    if args.transform == "asinh":
+        scale = fit_asinh_scale(flat_data["train"][1], mask, k, c)
+        forward = lambda x: scale * np.arcsinh(x / scale)
+        inverse = lambda x: scale * np.sinh(np.asarray(x, np.float32) / scale)
+        flat_data = {split: (cond_, Mapped(coeff_, forward)) for split, (cond_, coeff_) in flat_data.items()}
+        vcond, vcoeff = flat_data["validation"]
     lat = np.deg2rad(archive.latitudes)
     w = np.repeat(np.cos(lat), nx); w = w / w.mean()
     weights = {"w": w, "grid": (ny, nx)}
     names = list(archive.channel_names)
     from dinosaur import spherical_harmonic
     from neuralgcm_mz.spatial import spherical_noise
-    length = float((checkpoint.get("noise_model") or {}).get("correlation_km_fast", 300.))
+    length = args.corr_km if args.corr_km is not None else float(
+        (checkpoint.get("noise_model") or {}).get("correlation_km_fast", 300.))
     correlated = spherical_noise(spherical_harmonic.Grid.TL63(), length)
     white = lambda key, shape: jax.random.normal(key, shape)
 
@@ -370,6 +528,10 @@ def main():
                        lambda key: init_unet(key, sum(train_dims), k * c), 5e-4),
               "unet_attn": (lambda p, x, cc, t: unet(p, x, cc, t, (ny, nx)),
                             lambda key: init_unet(key, sum(train_dims), k * c, attention=True), 5e-4)}
+    n_var = len(dict.fromkeys(n.split(":")[0] for n in names))
+    n_lev = c // n_var
+    models["unet3d"] = (lambda p, x, cc, t: unet3d(p, x, cc, t, (ny, nx), k, n_var, n_lev),
+                        lambda key: init_unet3d(key, k * n_var + 2 * n_var + 2, k * n_var), 5e-4)
     # Gaussian skip: eps_hat = base + network, where base is the exact denoiser
     # for independent Gaussian coefficients with the training variance. With a
     # zero network the sampler is that Gaussian; the network only learns the
@@ -391,7 +553,8 @@ def main():
         models[name + "_skip"] = (with_skip(model), init, lr)
     report = {"archive": args.archive, "checkpoint": args.checkpoint, "train_windows": len(flat_data["train"][1]),
               "validation_windows": len(real), "steps": args.steps, "members": args.members,
-              "fast_correlation_km": length, "variants": {}}
+              "fast_correlation_km": length, "x0_clip": args.x0_clip, "transform": args.transform,
+              "variants": {}}
     trained = {}
     for name in [n for n in models]:
         if name not in args.variants and name + "_corr" not in args.variants:
@@ -399,12 +562,13 @@ def main():
         model, init, lr = models[name]
         params = init(jax.random.PRNGKey(7))
         count = int(sum(np.size(x) for x in jax.tree_util.tree_leaves(params)))
-        saved = work / f"params_{name}_{args.steps}.pkl"  # our own scratch file
+        tag = "" if args.transform == "none" else f"_{args.transform}"
+        saved = work / f"params_{name}{tag}_{args.steps}.pkl"  # our own scratch file
         if saved.exists():
             with open(saved, "rb") as stream:
                 params, best, trace = pickle.load(stream)
         else:
-            params, best, trace = train(name, model, params, flat_data, m, args.steps, lr, 2, 11)
+            params, best, trace = train(name, model, params, flat_data, m, args.steps, lr, args.batch, 11)
             with open(saved, "wb") as stream:
                 pickle.dump((jax.device_get(params), best, trace), stream)
         trained[name] = (model, params)
@@ -441,12 +605,12 @@ def main():
                 model, params = trained[name.removesuffix("_corr")]
                 draw = corr_draw if name.endswith("_corr") else white
                 conds = vcond
-            run = jax.jit(lambda key, cc: sample(model, params, key, cc, m, (1, ny * nx, k * c), draw))
+            run = jax.jit(lambda key, cc: sample(model, params, key, cc, m, (1, ny * nx, k * c), draw, args.x0_clip))
             gen = np.zeros((args.members,) + real.shape, np.float16)  # [S,W,N,KC]
             for i in range(len(real)):
                 cc = jnp.asarray(conds[i:i+1], jnp.float32)
                 for s_ in range(args.members):
-                    gen[s_, i] = np.asarray(run(jax.random.PRNGKey(1000 * s_ + i), cc))[0]
+                    gen[s_, i] = inverse(np.asarray(run(jax.random.PRNGKey(1000 * s_ + i), cc))[0])
         # Amplitude gain per (mode, channel) on half the windows, as in training.
         sg = np.sqrt(np.mean(np.square(gen[:, gain_half], dtype=np.float32), axis=(0, 1, 2)))
         sr = np.sqrt(np.mean(real[gain_half] ** 2, axis=(0, 1)))
@@ -455,6 +619,9 @@ def main():
         held = ~gain_half
         shape5 = lambda x: x.reshape(x.shape[:-1] + (k, c))
         result = scores(shape5(gen[:, held]), shape5(real[held]), weights, names, mask)
+        multi = multivariate_scores(shape5(gen[:, held]), shape5(real[held]), weights, names, k, c)
+        for var, value in multi.items():
+            result["variables"][var].update(value)
         result["raw_gain_median"] = float(np.median(gain[gain != 1.0])) if np.any(gain != 1.0) else 1.0
         result["sample_seconds"] = time.time() - start
         report["variants"].setdefault(name, {}).update(result)
