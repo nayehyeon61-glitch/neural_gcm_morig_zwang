@@ -1,4 +1,5 @@
 """Small contract tests for I/O boundaries, independent of a real checkpoint."""
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -83,11 +84,17 @@ class FakeBackend:
         return {"temperature": state}
     def advance_interval(self, state, forcing, dt, correction=None):
         self.forcing_times.append(forcing["time_index"])
-        return state+1+(0 if correction is None else correction["temperature"])
+        return state+dt/86400+(0 if correction is None else correction["temperature"])
     def decode(self, state, forcing):
         return {"temperature": state}
     def persisted_forcings(self, state, forcing):
         return forcing
+    def spherical_noise(self, length_km):
+        from neuralgcm_mz.spatial import independent_noise
+        return independent_noise(2, 2)
+    timestep_seconds = 3600.
+    def with_memory(self, state, previous):
+        return state + 0.5*(previous-state)  # visible memory effect for the test
 
 
 class FakeReader:
@@ -159,6 +166,97 @@ def test_prepare_produces_sigma_residuals_with_correct_units(tmp_path, monkeypat
     assert archive.manifest["provenance"]["neuralgcm_sha256"] == workflow.checkpoint_sha256(base_checkpoint)
 
 
+def test_forecast_history_follows_archive_memory_mode(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    calls = []
+    backend.with_memory = lambda state, previous: calls.append(1) or state
+    FakeReader.max_allowed = 2
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    monkeypatch.setattr(workflow, "ClosureController", FakeController)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
+        "channel_names": ["temperature:sigma_0"], "dt_seconds": 86400, "config": {"history_steps": 2},
+        "provenance": {"neuralgcm_sha256": workflow.checkpoint_sha256(base_checkpoint), "memory": "warm (x)"}})
+    workflow.forecast({"neuralgcm_checkpoint": str(base_checkpoint), "closure_checkpoint": "model.npz",
+                       "variables": ["temperature"], "era5": "dummy", "issue_time": "2000-01-03",
+                       "output": str(tmp_path/"forecast"), "days": 2, "members": 1})
+    assert len(calls) == 1  # history intervals 0 (cold, no past) and 1 (warm)
+    meta = json.loads((tmp_path/"forecast"/"forecast.json").read_text())
+    assert meta["history_memory"] == "warm"
+
+
+def test_forecast_reuses_matching_baseline(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = 2
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    monkeypatch.setattr(workflow, "ClosureController", FakeController)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
+        "channel_names": ["temperature:sigma_0"], "dt_seconds": 86400, "config": {"history_steps": 2},
+        "provenance": {"neuralgcm_sha256": workflow.checkpoint_sha256(base_checkpoint)}})
+    config = {"neuralgcm_checkpoint": str(base_checkpoint), "closure_checkpoint": "model.npz",
+              "variables": ["temperature"], "era5": "dummy", "issue_time": "2000-01-03", "days": 3, "members": 1}
+    workflow.forecast({**config, "output": str(tmp_path/"a")})
+    calls = len(backend.forcing_times)
+    workflow.forecast({**config, "output": str(tmp_path/"b"), "reuse_baseline": str(tmp_path/"a")})
+    np.testing.assert_array_equal(np.load(tmp_path/"a"/"baseline.npy"), np.load(tmp_path/"b"/"baseline.npy"))
+    history = 2  # history intervals integrated before the issue time
+    assert len(backend.forcing_times) - calls == history + 3  # corrected run only
+    with pytest.raises(ValueError, match="different base settings"):
+        workflow.forecast({**config, "seed": 7, "output": str(tmp_path/"c"), "reuse_baseline": str(tmp_path/"a")})
+
+
+def test_prepare_warm_memory_uses_previous_trajectory(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = None
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    path = tmp_path/"archive"
+    workflow.prepare({"neuralgcm_checkpoint": str(base_checkpoint), "variables": ["temperature"],
+                      "era5": "dummy", "archive": str(path), "dt_hours": 24, "warm_memory": True})
+    archive = ResidualArchive(path)
+    np.testing.assert_array_equal(archive.states[:, 0, 0, 0], np.arange(11))  # truth is the encoding
+    # Interval 0 has no past and stays cold. Interval 1 starts from the
+    # encoding 1 blended with the previous trajectory one native step before
+    # its end (23/24), i.e. 1 - 1/48, so its 1-day residual is 1/48 per day.
+    assert archive.residual[0, 0, 0, 0] == 0
+    np.testing.assert_allclose(archive.residual[1, 0, 0, 0], 1/48/86400, rtol=1e-5)
+    assert archive.manifest["provenance"]["memory"].startswith("warm")
+    assert len(backend.forcing_times) == 2 * 11  # two legs per interval
+
+
+def test_prepare_resumes_interrupted_preparation(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = None
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    path = tmp_path/"archive"
+    config = {"neuralgcm_checkpoint": str(base_checkpoint), "variables": ["temperature"],
+              "era5": "dummy", "archive": str(path), "dt_hours": 24, "keep_preparation": True}
+    workflow.prepare(config)
+    full = np.array(ResidualArchive(path).residual)
+    # Simulate a crash after interval 5: later rows were never written.
+    from pathlib import Path
+    scratch = Path(str(path)+".preparation")
+    truth = np.load(scratch/"truth.npy", mmap_mode="r+"); predictions = np.load(scratch/"baseline.npy", mmap_mode="r+")
+    truth[0] = 0.5                     # the fake encodes interval 0 as exact zeros
+    truth[6:] = 0; predictions[6:] = 0; predictions[5, 0, 0, 0] = 0   # row 5 partly written
+    truth.flush(); predictions.flush(); del truth, predictions
+    import shutil; shutil.rmtree(path)
+    calls = len(backend.forcing_times)
+    workflow.prepare({**config, "resume": True})
+    assert len(backend.forcing_times) - calls == 11 - 4    # restarts at the last stored row (4)
+    np.testing.assert_array_equal(np.array(ResidualArchive(path).residual)[4:], full[4:])
+
+
 def test_forecast_rejects_wrong_backbone_checkpoint_before_rollout(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow, "_backend", lambda config: FakeBackend())
     monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
@@ -215,3 +313,22 @@ def test_climatology_reads_training_period_only(tmp_path, monkeypatch):
     assert FakeReader.visited == list(range(start, stop))
     np.testing.assert_array_equal(np.load(output), np.mean(np.arange(start, stop)))
     FakeReader.max_allowed = None
+
+
+def test_forecast_rejects_negative_noise_correlation(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = None
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    monkeypatch.setattr(workflow, "ClosureController", FakeController)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
+        "channel_names": ["temperature:sigma_0"], "dt_seconds": 86400,
+        "config": {"history_steps": 2},
+        "provenance": {"neuralgcm_sha256": workflow.checkpoint_sha256(base_checkpoint)}})
+    with pytest.raises(ValueError, match="noise_correlation_km"):
+        workflow.forecast({"neuralgcm_checkpoint": str(base_checkpoint), "closure_checkpoint": "model.npz",
+                           "variables": ["temperature"], "era5": "dummy", "issue_time": "2000-01-03",
+                           "output": str(tmp_path/"forecast"), "days": 5, "members": 1,
+                           "noise_correlation_km": -500})

@@ -21,7 +21,7 @@ class TrainingConfig:
     history_steps: int = 8
     block_steps: int = 8
     dt_hours: float = 6.0
-    max_period_hours: float = 48.0
+    max_period_hours: float = 96.0
     hidden: int = 128
     diffusion_steps: int = 32
     batch_columns: int = 64
@@ -34,17 +34,25 @@ class TrainingConfig:
     seed: int = 42
     memory_limit_gb: float = 96.0
     normalization_chunk_steps: int = 4
+    calibration_batches: int = 16
+    slow_noise_batches: int = 64
+    correlation_origins: int = 8
+    gaussian_skip: bool = True
+    phase_features: bool = False
 
     def __post_init__(self):
         positive_int = (
             "history_steps", "block_steps", "hidden", "diffusion_steps",
             "batch_columns", "closure_updates", "diffusion_updates",
             "validation_every", "validation_batches", "normalization_chunk_steps",
+            "calibration_batches", "slow_noise_batches", "correlation_origins",
         )
         for name in positive_int:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.phase_features, bool) or not isinstance(self.gaussian_skip, bool):
+            raise ValueError("phase_features and gaussian_skip must be true or false")
         if self.diffusion_steps < 2 or self.block_steps < 2:
             raise ValueError("diffusion_steps and block_steps must be at least 2")
         for name in ("dt_hours", "max_period_hours", "learning_rate", "gradient_clip", "memory_limit_gb"):
@@ -133,8 +141,31 @@ def normalize_history(states, past_residuals, normalizer):
     return np.concatenate((state, residual), axis=-1).astype(np.float32)
 
 
+PHASE_FEATURES = 2
+
+
+def solar_phase(times, longitudes_deg):
+    """Local solar time as (sin, cos), [columns, len(times), 2].
+
+    The innovation has a 24 h autocorrelation peak (diurnal model error); with
+    the phase as input the memory can predict that part instead of leaving it
+    to the noise. ``times`` are UTC datetime64 values of the history states.
+    """
+    hours = (np.asarray(times, "datetime64[s]").astype(np.int64) % 86400) / 3600.0
+    angle = 2 * np.pi * (hours[None, :] / 24.0 + np.asarray(longitudes_deg, np.float64)[:, None] / 360.0)
+    return np.stack((np.sin(angle), np.cos(angle)), axis=-1).astype(np.float32)
+
+
+def with_phase(history, times, longitudes_deg):
+    return np.concatenate((history, solar_phase(times, longitudes_deg)), axis=-1)
+
+
 def denormalize_tendency(values, normalizer):
     return values * normalizer["residual_std"] + normalizer["residual_mean"]
+
+
+TINY_STD = 1e-30
+GAIN_BOUNDS = (0.01, 5.0)
 
 
 def _stream_channel_moments(array, start: int, stop: int, chunk_steps: int):
@@ -158,8 +189,10 @@ def _stream_channel_moments(array, start: int, stop: int, chunk_steps: int):
     if count == 0:
         raise ValueError("Training split is empty")
     std = np.sqrt(m2 / count)
-    # Constant channels remain finite without amplifying small numerical errors.
-    std = np.where(std > 1e-12, std, 1.0)
+    # Exactly constant channels get a tiny scale, never 1: generated values
+    # are multiplied back by it, and a unit fallback turned stratospheric
+    # humidity residuals (std ~1e-12 kg/kg/s) into 1 kg/kg/s tendencies.
+    std = np.where(std > 0, std, TINY_STD)
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -196,14 +229,7 @@ def _check_rss(limit_gb):
         raise MemoryError(f"Process RSS {rss/1e9:.2f} GB reached the safety margin for {limit_gb:g} GB")
 
 
-def sample_batch(archive, origins, config, normalizer, rng):
-    """Read random columns from one origin; never materialize a global window.
-
-    Each past residual ends at its corresponding conditioning state. In
-    particular residual[origin] is a target and cannot appear in the history.
-    Latitude sampling is proportional to cos(latitude), for area-weighted
-    fitting on latitude-longitude grids.
-    """
+def _draw_columns(archive, origins, config, rng):
     if len(origins) == 0:
         raise ValueError("Split is too short for history and future block")
     origin = origins[int(rng.integers(len(origins)))]
@@ -213,6 +239,21 @@ def sample_batch(archive, origins, config, normalizer, rng):
         raise ValueError("Latitude grid has no positive area")
     ys = rng.choice(ny, config.batch_columns, p=weights / weights.sum())
     xs = rng.integers(nx, size=config.batch_columns)
+    return origin, ys, xs
+
+
+def sample_batch(archive, origins, config, normalizer, rng):
+    """Read random columns from one origin; never materialize a global window.
+
+    Each past residual ends at its corresponding conditioning state. In
+    particular residual[origin] is a target and cannot appear in the history.
+    Latitude sampling is proportional to cos(latitude), for area-weighted
+    fitting on latitude-longitude grids.
+    """
+    return _window(archive, *_draw_columns(archive, origins, config, rng), config, normalizer)
+
+
+def _window(archive, origin, ys, xs, config, normalizer):
     h, k = config.history_steps, config.block_steps
     # Slice time first: NumPy mixed advanced indexing would otherwise move the
     # column axis to the front depending on the exact expression.
@@ -220,10 +261,117 @@ def sample_batch(archive, origins, config, normalizer, rng):
     past = np.asarray(archive.residual[origin-h:origin][:, :, ys, xs]).transpose(2, 0, 1)
     future = np.asarray(archive.residual[origin:origin+k][:, :, ys, xs]).transpose(2, 0, 1)
     history = normalize_history(states, past, normalizer)
+    if getattr(config, "phase_features", False):
+        nx = archive.states.shape[-1]
+        history = with_phase(history, archive.timestamps[origin-h+1:origin+1], 360.0 * np.asarray(xs) / nx)
     target = ((future - normalizer["residual_mean"]) / normalizer["residual_std"]).astype(np.float32)
     if not np.isfinite(history).all() or not np.isfinite(target).all():
         raise ValueError("Selected training/validation window contains non-finite values")
     return history, target
+
+
+def fit_slow_noise(archive, origins, config, normalizer, rng, innovation):
+    """Covariance and block-to-block memory of the block-mean innovation.
+
+    The fast DDPM sees only DCT modes k>0, whose sum over each block is
+    exactly zero. The remaining block mean of ``target - closure mean`` is
+    the zero-frequency forcing that a Hasselmann-type slow response
+    integrates. It is modelled as a vector AR(1) process over consecutive
+    blocks, s' = phi s + sqrt(1-phi^2) L z, with L the Cholesky factor of the
+    channel covariance and one pooled phi (keeps the process stationary).
+    ``origins`` must allow two consecutive blocks inside the split.
+    """
+    k = config.block_steps
+    first, second = [], []
+    for _ in range(config.slow_noise_batches):
+        origin, ys, xs = _draw_columns(archive, origins, config, rng)
+        for target_list, start in ((first, origin), (second, origin + k)):
+            history, target = _window(archive, start, ys, xs, config, normalizer)
+            target_list.append(np.asarray(innovation(history, target)).mean(axis=1))
+    a = np.concatenate(first).astype(np.float64)
+    b = np.concatenate(second).astype(np.float64)
+    a -= a.mean(axis=0)
+    b -= b.mean(axis=0)
+    covariance = a.T @ a / len(a)
+    scale = max(float(np.mean(np.diag(covariance))), 1e-12)
+    cholesky = np.linalg.cholesky(covariance + 1e-6 * scale * np.eye(len(covariance)))
+    phi = float(np.clip(np.sum(a * b) / max(np.sum(a * a), 1e-12), 0.0, 0.99))
+    return {"slow_cholesky": cholesky.astype(np.float32), "slow_phi": phi,
+            "slow_std": np.sqrt(np.diag(covariance)).astype(np.float32),
+            "slow_samples": int(len(a))}
+
+
+def zonal_correlation_length(fields, latitudes, max_latitude=60.):
+    """Gaussian e-folding length (km) of zonal correlation, [sample,lat,lon,channel].
+
+    Each sample and channel is standardized over the globe. For every zonal
+    lag with correlation c in (0.05, 0.95), L = d / sqrt(-2 ln c) at that
+    lag's great-circle-chord distance d; the median over latitudes within
+    ``max_latitude`` and lags is returned. 0 means grid-scale white noise.
+    """
+    from .spatial import EARTH_RADIUS_KM
+    f = np.asarray(fields, np.float64)
+    f = (f - f.mean(axis=(1, 2), keepdims=True)) / np.maximum(f.std(axis=(1, 2), keepdims=True), 1e-12)
+    nx = f.shape[2]
+    lengths = []
+    for j, lat in enumerate(np.asarray(latitudes, np.float64)):
+        if abs(lat) > max_latitude:
+            continue
+        row = f[:, j]
+        for lag in range(1, max(2, nx // 4)):
+            c = float(np.mean(row * np.roll(row, lag, axis=1)))
+            if not 0.05 < c < 0.95:
+                if c <= 0.05:
+                    break
+                continue
+            d = EARTH_RADIUS_KM * np.cos(np.deg2rad(lat)) * 2 * np.pi * lag / nx
+            lengths.append(d / np.sqrt(-2 * np.log(c)))
+    return float(np.median(lengths)) if lengths else 0.0
+
+
+def fit_spatial_correlation(archive, origins, config, normalizer, rng, innovation, mask):
+    """Correlation lengths of the fast and block-mean innovation, from data.
+
+    The DDPM and AR(1) branches are column-wise, so their spatial structure
+    comes only from the random fields that drive them. Fitting the length
+    to training innovations replaces an arbitrary choice and sets how much
+    of the calibrated per-column variance reaches resolved scales.
+    """
+    from .spectral import dct, idct
+    ny, nx = archive.states.shape[-2:]
+    ys, xs = np.repeat(np.arange(ny), nx), np.tile(np.arange(nx), ny)
+    fast, slow = [], []
+    for _ in range(config.correlation_origins):
+        origin = origins[int(rng.integers(len(origins)))]
+        history, target = _window(archive, origin, ys, xs, config, normalizer)
+        e = np.asarray(innovation(history, target))
+        f = np.asarray(idct(dct(e, axis=1) * np.asarray(mask)[None, :, None], axis=1))
+        fast.append(f.reshape(ny, nx, *f.shape[1:]).transpose(2, 0, 1, 3))
+        slow.append(e.mean(axis=1).reshape(1, ny, nx, -1))
+    return {"correlation_km_fast": zonal_correlation_length(np.concatenate(fast), archive.latitudes),
+            "correlation_km_slow": zonal_correlation_length(np.concatenate(slow), archive.latitudes)}
+
+
+def calibrate_diffusion(sampler, batches, mask):
+    """Per (mode, channel) gain matching DDPM sample spread to held-out innovations.
+
+    A small denoiser with few reverse steps does not reproduce the target
+    variance (both inflation and sampler under-dispersion occur). The gain
+    is fitted on validation windows only and clipped to ``GAIN_BOUNDS``. An
+    undertrained epsilon network makes the ancestral sampler over-disperse
+    by far more than 5x, so the lower bound is wide; a gain at a bound means
+    the sampler is not calibrated and is flagged in the training summary.
+    """
+    target_power = 0.
+    sample_power = 0.
+    for i, (history, coefficients) in enumerate(batches):
+        draw = np.asarray(sampler(i, history))
+        target_power = target_power + np.sum(np.asarray(coefficients, np.float64)**2, axis=0)
+        sample_power = sample_power + np.sum(draw.astype(np.float64)**2, axis=0)
+    active = np.asarray(mask)[:, None] > 0
+    ratio = np.sqrt(target_power / np.maximum(sample_power, 1e-30))
+    gain = np.where(active, np.clip(ratio, *GAIN_BOUNDS), 1.0)
+    return gain.astype(np.float32)
 
 
 def train(archive_path, output_path, config: TrainingConfig | None = None):
@@ -238,7 +386,7 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     import optax
     from .closure import init_closure, predict_closure
     from .data import ResidualArchive
-    from .diffusion import init_denoiser, diffusion_loss
+    from .diffusion import init_denoiser, diffusion_loss, with_gaussian_skip
     from .spectral import dct, highpass_mask
 
     config = config or TrainingConfig()
@@ -259,8 +407,9 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     channels = archive.states.shape[1]
     key = jax.random.PRNGKey(config.seed)
     key, closure_key, diffusion_key = jax.random.split(key, 3)
-    closure_params = init_closure(closure_key, config.history_steps, channels, config.block_steps, config.hidden)
-    diffusion_params = init_denoiser(diffusion_key, config.history_steps, channels, config.block_steps, config.hidden)
+    extra = PHASE_FEATURES if config.phase_features else 0
+    closure_params = init_closure(closure_key, config.history_steps, channels, config.block_steps, config.hidden, extra)
+    diffusion_params = init_denoiser(diffusion_key, config.history_steps, channels, config.block_steps, config.hidden, extra)
     mask = highpass_mask(config.block_steps, config.dt_hours, config.max_period_hours)
     if not np.asarray(mask).any():
         raise ValueError("No high-frequency DCT modes selected")
@@ -321,6 +470,11 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
     diffusion_eval = jax.jit(ddpm_loss)
     validation_coeff = [(h, innovation_coefficients(h, t)) for h, t in validation]
     validation_keys = jax.random.split(jax.random.PRNGKey(config.seed + 2), len(validation))
+    if config.gaussian_skip:
+        variance = np.mean([np.mean(np.square(np.asarray(innovation_coefficients(*sample_batch(
+            archive, train_origins, config, normalizer, rng)))), axis=0)
+            for _ in range(config.calibration_batches)], axis=0)
+        diffusion_params = with_gaussian_skip(diffusion_params, variance, config.diffusion_steps)
     state = optimizer.init(diffusion_params)
     best_value = float("inf")
     best_diffusion = diffusion_params
@@ -339,8 +493,36 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
                 best_value, best_diffusion = value, diffusion_params
             trace.append({"stage": "diffusion", "update": step, "train_loss": train_loss, "validation_loss": value})
             _check_rss(config.memory_limit_gb)
+    # Noise calibration: amplitude per mode and the zero-frequency AR(1) branch.
+    from .diffusion import sample as ddpm_sample
+    crng = np.random.default_rng(config.seed + 3)
+    calibration = [sample_batch(archive, validation_origins, config, normalizer, crng)
+                   for _ in range(config.calibration_batches)]
+    draw = jax.jit(lambda k, h: ddpm_sample(best_diffusion, k, h, mask, config.diffusion_steps))
+    calibration_key = jax.random.PRNGKey(config.seed + 4)
+    diffusion_gain = calibrate_diffusion(
+        lambda i, h: draw(jax.random.fold_in(calibration_key, i), h),
+        [(h, innovation_coefficients(h, t)) for h, t in calibration], mask)
+    pair_origins = archive.window_origins("train", config.history_steps, 2 * config.block_steps)
+    if not pair_origins:
+        raise ValueError("Training split needs history_steps + 2*block_steps samples for slow noise")
+    innovation = jax.jit(lambda h, t: t - predict_closure(closure_params, h))
+    slow = fit_slow_noise(archive, pair_origins, config, normalizer,
+                          np.random.default_rng(config.seed + 5), innovation)
+    spatial = fit_spatial_correlation(archive, train_origins, config, normalizer,
+                                      np.random.default_rng(config.seed + 6), innovation, mask)
+    noise_model = {"version": 1, "diffusion_gain": diffusion_gain, **slow, **spatial}
     summary = {
         "closure_validation_loss": closure_validation_loss,
+        "noise_calibration": {"diffusion_gain_min": float(np.min(diffusion_gain)),
+                              "diffusion_gain_max": float(np.max(diffusion_gain)),
+                              "diffusion_gain_at_bound": float(np.mean(np.isclose(
+                                  diffusion_gain[np.asarray(mask) > 0], GAIN_BOUNDS[0]) | np.isclose(
+                                  diffusion_gain[np.asarray(mask) > 0], GAIN_BOUNDS[1]))),
+                              "slow_phi": slow["slow_phi"],
+                              "slow_std_mean": float(np.mean(slow["slow_std"])),
+                              "slow_samples": slow["slow_samples"], **spatial,
+                              "gain_fit_split": "validation", "slow_fit_split": "train"},
         "diffusion_validation_loss": best_value,
         "normalization_fit_split": "train", "train_bounds": [start, stop],
         "train_windows": len(train_origins), "validation_windows": len(validation_origins),
@@ -354,6 +536,7 @@ def train(archive_path, output_path, config: TrainingConfig | None = None):
         "config": asdict(config),
         "closure_params": closure_params,
         "diffusion_params": best_diffusion,
+        "noise_model": noise_model,
         "normalizer": normalizer,
         "channel_names": list(archive.channel_names),
         "state_units": archive.manifest["state_units"],

@@ -8,6 +8,7 @@ from collections import deque
 import argparse
 import glob
 import hashlib
+import shutil
 import json
 from pathlib import Path
 import numpy as np
@@ -15,6 +16,7 @@ import numpy as np
 from .data import validate_timestamps, write_residual_archive, ResidualArchive
 from .resources import check_process_memory
 from .rollout import ClosureController, pack_sigma, unpack_sigma
+from .spatial import independent_noise
 from .training import load_checkpoint
 
 VARIABLES = ('temperature','u','v','specific_humidity')
@@ -125,20 +127,51 @@ def prepare(config):
     variables,names,units=_variables(config,backend)
     output=Path(config['archive'])
     temporary=Path(str(output)+'.preparation')
-    temporary.mkdir(parents=True,exist_ok=False)
     n=len(reader.times)
     sigma,lon,lat=backend.sigma_shape
     shape=(len(names),lat,lon)
-    truth=np.lib.format.open_memmap(temporary/'truth.npy',mode='w+',dtype='float32',shape=(n,*shape))
-    predictions=np.lib.format.open_memmap(temporary/'baseline.npy',mode='w+',dtype='float32',shape=(n-1,*shape))
+    # resume: continue an interrupted preparation from its first interval
+    # with no stored prediction (the arrays are written in time order).
+    resume=bool(config.get('resume',False)) and temporary.exists()
+    if not resume:
+        temporary.mkdir(parents=True,exist_ok=False)
+    mode='r+' if resume else 'w+'
+    truth=np.lib.format.open_memmap(temporary/'truth.npy',mode=mode,dtype='float32',shape=(n,*shape))
+    predictions=np.lib.format.open_memmap(temporary/'baseline.npy',mode=mode,dtype='float32',shape=(n-1,*shape))
+    if resume and (truth.shape!=(n,*shape) or predictions.shape!=(n-1,*shape)):
+        raise ValueError('Interrupted preparation does not match this configuration')
+    # A row counts as stored when almost none of its values are exactly zero
+    # (an interrupted write leaves zero pages); the last stored row is redone.
+    stored=lambda row: np.mean(row==0)<0.01
+    start=max(0,next((i for i in range(n-1) if not (stored(truth[i]) and stored(predictions[i]))),n-1)-1) if resume else 0
     rng=jax.random.PRNGKey(config.get('encoder_seed',0))
-    for i in range(n):
+    # warm_memory: start each interval with NeuralGCM's memory set to the
+    # state one native step earlier on the previous interval's trajectory,
+    # as mid-forecast, instead of the cold encoder memory. The cold version
+    # puts an encoding adjustment (40-53% of the 6 h residual rms on the
+    # 2.8 deg checkpoint) into the residuals that forecasts never see.
+    warm=bool(config.get('warm_memory',False))
+    previous=None
+    if warm and start>0:
+        # Rebuild the carried memory from the interval before the restart;
+        # that interval itself starts cold, a one-interval approximation.
+        _,inputs,forcing=reader.record(start-1)
+        state=backend.encode(inputs,forcing,rng_key=rng)
+        previous=backend.advance_interval(state,forcing,dt-backend.timestep_seconds)
+    if start: print(f'resuming at interval {start}/{n-1}',flush=True)
+    for i in range(start,n):
         check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
         _,inputs,forcing=reader.record(i)
         state=backend.encode(inputs,forcing,rng_key=rng)
         truth[i]=pack_sigma(backend.sigma_fields(state),variables)
+        if warm and previous is not None:
+            state=backend.with_memory(state,previous)
         if i<n-1:
-            next_state=backend.advance_interval(state,forcing,dt)
+            if warm:
+                previous=backend.advance_interval(state,forcing,dt-backend.timestep_seconds)
+                next_state=backend.advance_interval(previous,forcing,backend.timestep_seconds)
+            else:
+                next_state=backend.advance_interval(state,forcing,dt)
             predictions[i]=pack_sigma(backend.sigma_fields(next_state),variables)
         if i%20==0: print(f'encoded interval {i}/{n-1}',flush=True)
     truth.flush(); predictions.flush()
@@ -150,7 +183,8 @@ def prepare(config):
                     'neuralgcm_sha256':checkpoint_sha256(config['neuralgcm_checkpoint']),
                     'encoder_seed':config.get('encoder_seed',0),
                     'variables':list(variables),'target':'encoded observed next state minus frozen teacher-forced next state',
-                    'forcing':'interval-start persistence','dt_seconds':dt})
+                    'forcing':'interval-start persistence','dt_seconds':dt,
+                    'memory':'warm (previous interval, one native step back)' if warm else 'cold (encoder)'})
     # Keep preparation arrays only on explicit request; they are reproducible scratch.
     if not config.get('keep_preparation',False):
         del truth,predictions
@@ -206,10 +240,59 @@ def forecast(config):
     out_names=[f'{v}:{level:g}hPa' for v in variables for level in plevels]
     out_shape=(1,members,round(days),len(out_names),sample_ds.sizes['latitude'],sample_ds.sizes['longitude'])
     base_file=np.lib.format.open_memmap(output/'baseline.npy',mode='w+',dtype='float32',shape=out_shape)
+    # reuse_baseline: copy the base trajectories of an earlier forecast with the
+    # same base settings instead of integrating them again (calibration scans).
+    reused=None
+    if config.get('reuse_baseline'):
+        source=Path(config['reuse_baseline'])
+        with open(source/'forecast.json') as stream: previous=json.load(stream)
+        mine={'issue_time':str(issue),'members':members,'lead_days':list(range(1,round(days)+1)),
+              'seed':config.get('seed',42),'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
+              'initial_perturbation':config.get('initial_perturbation'),'encoder_seed':config.get('encoder_seed',trained_seed)}
+        defaults={'encoder_seed':0}  # older forecast.json files did not record it
+        if any(previous.get(key,defaults.get(key))!=value for key,value in mine.items()):
+            raise ValueError('reuse_baseline forecast has different base settings')
+        reused=np.load(source/'baseline.npy',mmap_mode='r')
+        if reused.shape!=out_shape: raise ValueError('reuse_baseline shape differs')
     ens_file=np.lib.format.open_memmap(output/'ensemble.npy',mode='w+',dtype='float32',shape=out_shape)
+    # Spatially correlated closure noise; 0 restores independent columns.
+    # Default: lengths fitted to the training innovations, else 500 km.
+    fitted=checkpoint.get('noise_model') or {}
+    correlation_km=float(config.get('noise_correlation_km',fitted.get('correlation_km_fast',500)))
+    slow_correlation_km=float(config.get('slow_noise_correlation_km',config.get('noise_correlation_km',
+                                         fitted.get('correlation_km_slow',500))))
+    for name,value in (('noise_correlation_km',correlation_km),('slow_noise_correlation_km',slow_correlation_km)):
+        if not np.isfinite(value) or value<0:
+            raise ValueError(f'{name} must be finite and >= 0 (0 = independent columns)')
+    noise_fn=backend.spherical_noise(correlation_km) if correlation_km>0 else None
+    if slow_correlation_km==correlation_km:
+        slow_noise_fn=noise_fn
+    elif slow_correlation_km>0:
+        slow_noise_fn=backend.spherical_noise(slow_correlation_km)
+    else:
+        _,lon,lat=backend.sigma_shape
+        slow_noise_fn=independent_noise(lat,lon)
+    perturbation=config.get('initial_perturbation')
+    # noise_scale sets the common amplitude of both noise branches and keeps
+    # their calibrated ratio, hence the residual's temporal spectrum. Scaling
+    # only the DDPM branch makes the block-constant AR(1) part dominate: in
+    # closed loop (experiments/closure_loop_check.py) fast 0.5 / slow 1 gave
+    # a 6 h autocorrelation of 0.5 inside blocks and 0.2 across them, against
+    # 0.25 in both places for the real residual.
+    common=float(config.get('noise_scale',1.0))
+    fast_scale=common*float(config.get('fast_noise_scale',1.0))
+    slow_scale=common*float(config.get('slow_noise_scale',1.0))
+    if not all(np.isfinite(v) and v>=0 for v in (common,fast_scale,slow_scale)):
+        raise ValueError('noise_scale, fast_noise_scale and slow_noise_scale must be finite and >= 0')
+    if perturbation is not None:
+        unknown=set(perturbation)-{'temperature_k','wind_ms','correlation_km'}
+        if unknown: raise ValueError(f'Unknown initial_perturbation keys: {sorted(unknown)}')
+        perturbation_fn=backend.spherical_noise(float(perturbation.get('correlation_km',500)))
+    warm_history=str(checkpoint.get('provenance',{}).get('memory','cold')).startswith('warm')
     for member in range(members):
         # Historical residual proxy uses fixed encoder noise, matching preparation.
-        states=[]; residuals=[]; previous_prediction=None
+        # History residuals are formed the way the training archive was (warm or cold memory).
+        states=[]; residuals=[]; previous_prediction=None; previous=None
         encoder_key=jax.random.PRNGKey(trained_seed)
         for i in range(origin-h,origin+1):
             _,inputs,forcing=reader.record(i)
@@ -218,27 +301,52 @@ def forecast(config):
             if previous_prediction is not None:
                 states.append(field); residuals.append((field-previous_prediction)/dt)
             if i<origin:
-                pred=backend.advance_interval(current,forcing,dt)
+                if warm_history:
+                    if previous is not None:
+                        current=backend.with_memory(current,previous)
+                    previous=backend.advance_interval(current,forcing,dt-backend.timestep_seconds)
+                    pred=backend.advance_interval(previous,forcing,backend.timestep_seconds)
+                else:
+                    pred=backend.advance_interval(current,forcing,dt)
                 previous_prediction=pack_sigma(backend.sigma_fields(pred),variables)
-        # Matched base and corrected initial stochastic state; independent per member.
-        initial=backend.encode(inputs,forcing,rng_key=jax.random.PRNGKey(config.get('seed',42)+member))
-        states[-1]=pack_sigma(backend.sigma_fields(initial),variables)
+        # Matched base and corrected initial state; independent per member.
+        # Separate keys for the encoder, the initial perturbation and the closure.
+        encoder_member,perturb_key,closure_key=jax.random.split(
+            jax.random.fold_in(jax.random.PRNGKey(config.get('seed',42)),member),3)
+        initial=backend.encode(inputs,forcing,rng_key=encoder_member)
+        if perturbation is not None:
+            sigma=backend.sigma_shape[0]
+            unit=np.asarray(perturbation_fn(perturb_key,3*sigma)).swapaxes(-1,-2)
+            initial=backend.perturb(initial,{
+                'temperature':float(perturbation.get('temperature_k',0.5))*unit[:sigma],
+                'u':float(perturbation.get('wind_ms',1.0))*unit[sigma:2*sigma],
+                'v':float(perturbation.get('wind_ms',1.0))*unit[2*sigma:]})
+        # Keep the last (state, residual) pair aligned: the residual ends in
+        # the state the controller actually sees, perturbed or re-encoded.
+        field=pack_sigma(backend.sigma_fields(initial),variables)
+        residuals[-1]=residuals[-1]+(field-states[-1])/dt
+        states[-1]=field
         controller=ClosureController(checkpoint,np.stack(states),np.stack(residuals),
-            seed=config.get('seed',42)+member,correction_scale=config.get('correction_scale',0.1),
+            seed=closure_key,correction_scale=config.get('correction_scale',0.1),
             tendency_clip_std=config.get('tendency_clip_std',5),tile_columns=config.get('tile_columns',256),
-            mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96))
+            mode=config.get('mode','full'),memory_limit_gb=config.get('memory_limit_gb',96),
+            noise_fn=noise_fn,slow_noise=config.get('slow_noise',True),issue_time=issue,
+            slow_noise_scale=slow_scale,fast_noise_scale=fast_scale,slow_noise_fn=slow_noise_fn,
+            overlap_steps=int(config.get('overlap_steps',0)))
         base=initial; corrected=initial
         for step in range(round(days*86400/dt)):
             check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
             tendency=controller.tendency()
             correction=None if not np.any(tendency) else unpack_sigma(tendency,variables,backend.sigma_shape[0])
             # The same issue-time SST/sea-ice is persisted for both trajectories.
-            base=backend.advance_interval(base,forcing,dt)
+            if reused is None:
+                base=backend.advance_interval(base,forcing,dt)
             corrected=backend.advance_interval(corrected,forcing,dt,correction)
             controller.observe_generated(pack_sigma(backend.sigma_fields(corrected),variables),tendency)
             if (step+1)%round(daily)==0:
                 day=(step+1)//round(daily)
-                b=_pressure_fields(backend.decode(base,backend.persisted_forcings(base,forcing)),variables)
+                b=(np.asarray(reused[0,member,day-1]) if reused is not None else
+                   _pressure_fields(backend.decode(base,backend.persisted_forcings(base,forcing)),variables))
                 e=_pressure_fields(backend.decode(corrected,backend.persisted_forcings(corrected,forcing)),variables)
                 if not np.isfinite(b).all() or not np.isfinite(e).all():
                     raise FloatingPointError(f'Nonfinite decoded forecast at day {day}')
@@ -260,11 +368,25 @@ def forecast(config):
         np.save(output/'latitude_weights.npy',np.polynomial.legendre.leggauss(len(latitudes))[1])
     metadata={'issue_time':str(issue),'lead_days':list(range(1,round(days)+1)),
         'channel_names':out_names,'variables':list(variables),'pressure_levels_hpa':plevels.tolist(),
-        'members':members,'forcing':'issue-time persistence; no future ERA5 conditioning',
+        'members':members,'encoder_seed':config.get('encoder_seed',trained_seed),'forcing':'issue-time persistence; no future ERA5 conditioning',
         'first_interval':'pure NeuralGCM','closure_mode':config.get('mode','full'),
         'correction_scale':config.get('correction_scale',0.1),'seed':config.get('seed',42),
         'neuralgcm_checkpoint':str(config['neuralgcm_checkpoint']),
         'closure_checkpoint':str(config['closure_checkpoint']),'status':'forecast only; skill unverified'}
+    metadata['noise_correlation_km']=correlation_km
+    metadata['slow_noise_correlation_km']=slow_correlation_km
+    metadata['noise_scale']=common
+    metadata['overlap_steps']=int(config.get('overlap_steps',0))
+    metadata['history_memory']='warm' if warm_history else 'cold'
+    metadata['fast_noise_scale']=fast_scale
+    metadata['slow_noise']=(bool(config.get('slow_noise',True)) and slow_scale>0
+        and 'slow_cholesky' in (checkpoint.get('noise_model') or {}))
+    metadata['slow_noise_scale']=slow_scale
+    metadata['initial_perturbation']=perturbation
+    # A deterministic baseline repeated M times has no spread: ensemble-mean
+    # RMSE and CRPS of the candidate then improve from averaging alone.
+    metadata['baseline_spread_source']=('matched initial perturbation' if perturbation is not None
+        else 'NeuralGCM internal randomness only (none for deterministic checkpoints)')
     metadata['evaluation_split']=split
     metadata['split_bounds_checked']=split is not None
     write_json(output/'forecast.json',metadata)
@@ -297,9 +419,13 @@ def verify(config):
         config['climatology'],lead_days=metadata['lead_days'],channel_names=metadata['channel_names'],
         latitudes=np.load(output/'latitudes.npy'),latitude_weights=np.load(weight_path) if weight_path.exists() else None,
         short_tolerance=config.get('short_tolerance',0.02),
+        require_40_days=bool(config.get('require_40_days',True)),
         evaluation_split=config.get('evaluation_split','test'),
         climatology_provenance=config['climatology_provenance'],
         budget_gib=config.get('memory_limit_gb',96)*1e9/1024**3)
+    if metadata.get('initial_perturbation') is None and metadata.get('members',1)>1:
+        result['comparison_warning']=('Baseline members differ only through NeuralGCM internal randomness. '
+            'For a deterministic checkpoint, set initial_perturbation so ensemble-mean RMSE/CRPS gains are not an averaging artefact.')
     write_json(output/'evaluation.json',result)
     return result
 
@@ -338,6 +464,74 @@ def climatology(config):
     return metadata
 
 
+def calibrate(config):
+    """Choose the noise strength on validation cases only.
+
+    ``noise_scales`` scales both noise branches together (recommended: it
+    keeps the fitted temporal spectrum); the older ``fast_noise_scales``
+    scales the DDPM branch alone, for ablations.
+    For each candidate value every case is forecast and
+    verified. A candidate is admissible when every case passes the day 1/3/5
+    RMSE gate; among those, the one whose median day-1..5 spread/skill ratio
+    is closest to 1 (from below preferred: ratio <= 1 + tolerance) wins.
+    Falls back to 0 (no fast noise) when none is admissible. The test split
+    is never used; freeze the result before held-out evaluation.
+
+    Optional ``correction_scales`` (gamma) searches gamma and the noise knob
+    jointly on the same rule; gamma 0 is NeuralGCM alone and is run once.
+    The fallback is then gamma 0 and noise 0 (no correction).
+    """
+    if ('noise_scales' in config)==('fast_noise_scales' in config):
+        raise ValueError('Give exactly one of noise_scales and fast_noise_scales')
+    knob='noise_scale' if 'noise_scales' in config else 'fast_noise_scale'
+    scales=[float(v) for v in config[knob+'s']]
+    if not scales or any((not np.isfinite(v)) or v<0 for v in scales):
+        raise ValueError(f'{knob}s must be a nonempty list of nonnegative numbers')
+    joint='correction_scales' in config
+    gammas=[float(v) for v in config['correction_scales']] if joint else [None]
+    if joint and (not gammas or any((not np.isfinite(v)) or not 0<=v<=1 for v in gammas)):
+        raise ValueError('correction_scales must be a nonempty list of numbers in [0, 1]')
+    grid=[(g,s) for g in gammas for s in ([0.0] if g==0 else scales)]
+    # resume: keep cases that already have an evaluation report.
+    resume=bool(config.get('resume',False))
+    root=Path(config['run_directory']); root.mkdir(parents=True,exist_ok=resume)
+    tolerance=float(config.get('spread_tolerance',0.1))
+    rows=[]
+    for gamma,scale in grid:
+        reports=[]
+        name=f'scale_{scale:g}' if gamma is None else f'gamma_{gamma:g}_scale_{scale:g}'
+        settings={knob:scale} if gamma is None else {knob:scale,'correction_scale':gamma}
+        for i,case in enumerate(config['cases']):
+            if case.get('evaluation_split','validation')!='validation':
+                raise ValueError('Calibration uses validation cases only')
+            out=root/name/f'case_{i:03d}'
+            out.parent.mkdir(parents=True,exist_ok=True)
+            if resume and (out/'evaluation.json').exists():
+                reports.append(json.loads((out/'evaluation.json').read_text()))
+                continue
+            if resume and out.exists():
+                shutil.rmtree(out)                  # interrupted case: redo it
+            forecast({**config.get('forecast',{}),**case,**settings,
+                      'evaluation_split':'validation','output':str(out)})
+            reports.append(verify({**config.get('verify',{}),'forecast_output':str(out),
+                                   'evaluation_split':'validation'}))
+        ratios=[x for r in reports for day in ('1','3','5')
+                for x in (r['leads'].get(day,{}).get('spread_skill_ratio') or []) if x is not None]
+        ratio=float(np.median(ratios)) if ratios else float('nan')
+        rows.append({**settings,'short_range_gate':all(r['short_range_gate']['passed'] for r in reports),
+                     'median_spread_skill_day1_5':ratio})
+    admissible=[r for r in rows if r['short_range_gate'] and np.isfinite(r['median_spread_skill_day1_5'])
+                and r['median_spread_skill_day1_5']<=1+tolerance]
+    best=min(admissible,key=lambda r:abs(r['median_spread_skill_day1_5']-1)) if admissible else None
+    result={f'chosen_{knob}':best[knob] if best else 0.0,'candidates':rows,'spread_tolerance':tolerance,
+            'rule':'day 1/3/5 RMSE gate on every case; spread/skill closest to 1 and <= 1+tolerance; else 0',
+            'split':'validation'}
+    if joint:
+        result['chosen_correction_scale']=best['correction_scale'] if best else 0.0
+    write_json(root/'calibration.json',result)
+    return result
+
+
 def run(config):
     """One command for a complete, explicitly configured research experiment."""
     from .training import TrainingConfig, train
@@ -368,7 +562,7 @@ def run(config):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=['prepare','forecast','verify','climatology','run'])
+    parser.add_argument('command',choices=['prepare','forecast','verify','climatology','calibrate','run'])
     parser.add_argument('config')
     args=parser.parse_args()
     config=json.loads(Path(args.config).read_text())

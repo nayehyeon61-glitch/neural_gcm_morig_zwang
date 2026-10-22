@@ -98,25 +98,54 @@ class NeuralGCMBackend:
             output[key] = grid.to_nodal(value)
         return output
 
-    def _modal_correction(self, state, tendencies_si):
+    def _modal_correction(self, state, tendencies_si, rate=True):
+        """SI nodal fields -> nondimensional modal state increments.
+
+        ``rate=True`` reads tendencies (K/s, m/s², 1/s); ``rate=False`` reads
+        state increments (K, m/s, kg/kg) for initial-condition perturbations.
+        """
+        per = "/s" if rate else ""
         s = state.state if hasattr(state, "state") else state
         fields, restore = self.pytree_utils.as_dict(s)
         result = jax.tree_util.tree_map(jnp.zeros_like, fields)
         grid = self.model.model_coords.horizontal
         zero = jnp.zeros(self.sigma_shape, dtype=jnp.float32)
         t = tendencies_si.get("temperature", zero)
-        result["temperature_variation"] = grid.to_modal(self.model.to_nondim_units(t, "K/s"))
+        result["temperature_variation"] = grid.to_modal(self.model.to_nondim_units(t, "K" + per))
         # Exact spherical velocity->divergence/vorticity mapping used by upstream
         # ToModalWithDivCurlTransform, including its cos(latitude) convention.
-        u = self.model.to_nondim_units(tendencies_si.get("u", zero), "m/s^2")
-        v = self.model.to_nondim_units(tendencies_si.get("v", zero), "m/s^2")
+        wind = "m/s^2" if rate else "m/s"
+        u = self.model.to_nondim_units(tendencies_si.get("u", zero), wind)
+        v = self.model.to_nondim_units(tendencies_si.get("v", zero), wind)
         uv = (grid.to_modal(u / grid.cos_lat), grid.to_modal(v / grid.cos_lat))
         result["divergence"] = grid.div_cos_lat(uv)
         result["vorticity"] = grid.curl_cos_lat(uv)
         for key in fields["tracers"]:
             result["tracers"][key] = grid.to_modal(
-                self.model.to_nondim_units(tendencies_si.get(key, zero), "1/s"))
+                self.model.to_nondim_units(tendencies_si.get(key, zero), "1/s" if rate else "dimensionless"))
         return restore(result)
+
+    def spherical_noise(self, length_km, **kwargs):
+        """Unit-variance isotropic fields [n,lat,lon] on the model grid."""
+        from .spatial import spherical_noise
+        return spherical_noise(self.model.model_coords.horizontal, length_km, **kwargs)
+
+    def perturb(self, state, increments_si: Mapping[str, Any]):
+        """Add SI nodal increments (K, m/s, kg/kg) on sigma levels to a state.
+
+        Used for matched initial-condition ensembles: the same perturbed
+        state starts the baseline and the corrected member, so baseline and
+        candidate ensembles both have spread and are compared fairly.
+        """
+        import dataclasses
+        for key, value in increments_si.items():
+            if np.shape(value) != self.sigma_shape:
+                raise ValueError(f"{key}: expected sigma nodal shape {self.sigma_shape}")
+        delta = self._modal_correction(state, increments_si, rate=False)
+        inner = state.state if hasattr(state, "state") else state
+        add = lambda a, b: a + b if b is not None else a
+        updated = jax.tree_util.tree_map(add, inner, delta, is_leaf=lambda x: x is None)
+        return dataclasses.replace(state, state=updated) if hasattr(state, "state") else updated
 
     def _step_impl(self, params, state, forcings, correction):
         seen = []
@@ -176,6 +205,17 @@ class NeuralGCMBackend:
                 raise ValueError(f"{key}: expected sigma nodal shape {self.sigma_shape}, got {np.shape(value)}")
         modal = self._modal_compiled(state, tendencies_si)
         return self._step_compiled(self.model.params, state, forcings, modal)
+
+    def with_memory(self, state, previous):
+        """``state`` with NeuralGCM's memory taken from ``previous``.
+
+        ``encode`` sets the memory to the encoded state itself (no past), so
+        the first steps after an encoding carry an adjustment that a running
+        forecast does not have. Supplying the model state one native step
+        earlier reproduces the mid-forecast memory.
+        """
+        import dataclasses
+        return dataclasses.replace(state, memory=previous.state)
 
     def persisted_forcings(self, state, forcings):
         """Reuse supplied boundary values at the current physical time.

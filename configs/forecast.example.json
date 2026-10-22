@@ -8,12 +8,26 @@
   "regrid": true,
   "days": 40,
   "members": 4,
-  "variables": ["temperature", "u", "v", "specific_humidity"],
+  "variables": [
+    "temperature",
+    "u",
+    "v",
+    "specific_humidity"
+  ],
   "mode": "full",
   "correction_scale": 0.1,
   "tendency_clip_std": 5,
   "tile_columns": 256,
   "seed": 42,
   "encoder_seed": 0,
-  "memory_limit_gb": 96
+  "memory_limit_gb": 96,
+  "noise_correlation_km": 500,
+  "slow_noise": true,
+  "noise_scale": 0.5,
+  "slow_noise_scale": 1.0,
+  "initial_perturbation": {
+    "temperature_k": 0.5,
+    "wind_ms": 1.0,
+    "correlation_km": 500
+  }
 }

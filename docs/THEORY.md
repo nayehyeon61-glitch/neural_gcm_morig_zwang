@@ -44,6 +44,8 @@ The forecast is teacher-forced: each baseline interval starts from the correspon
 
 For internal NeuralGCM correction, both terms must be expressed on its **sigma-level nodal model grid**, with identical variables, vertical levels, units and ordering. When ERA5 is mapped through the frozen encoder to form sigma targets, the target is a discrepancy in the encoded model representation. It includes encoder/regridding error and representation mismatch. Encoding observed endpoints separately does not reveal the unique true unresolved tendency; use deterministic/reproducible encoding and record the checkpoint and conversion procedure.
 
+`prepare` encodes every interval afresh, and NeuralGCM's encoder sets the model memory to the encoded state itself (no past). Mid-forecast the memory is the state one native step earlier. On the 2.8° deterministic checkpoint the two 6 h residuals have about the same rms, but their difference is 40–53% of it (`experiments/cold_memory_check.py`): about half of a cold residual's pattern is an encoding adjustment a running forecast never sees. `warm_memory: true` in the prepare configuration starts each interval with the memory taken from the previous interval's trajectory one native step before its end (the first interval stays cold). It costs one extra call per interval and needs a fresh archive.
+
 Dividing endpoint error by the data interval produces an **interval-averaged tendency proxy**. It is not the exact instantaneous missing physics. Injecting this constant proxy through a nonlinear solver does not guarantee exact endpoint recovery. Its quality and stability must be assessed through independent rollouts.
 
 The backend takes temperature tendencies in K/s, wind tendencies in m/s² and tracer tendencies in 1/s on `[sigma, longitude, latitude]`. It converts physical units and horizontal vector tendencies into NeuralGCM's spectral state representation. Pressure-level residual arrays cannot be passed directly to that interface. Temperature and moisture outputs are not uniquely attributable to radiation, condensation, turbulence or other specific processes.
@@ -108,9 +110,59 @@ Mori–Zwanzig reduction distinguishes a resolved/Markovian term, a history term
 
 Hasselmann's construction concerns a slow system's response to rapidly decorrelating forcing, with stabilizing feedback yielding stationary red variability. It motivates keeping past shocks relevant to subsequent dynamics. It does not imply that an individual future weather shock is known, or that adding noise improves forecast accuracy.
 
-**Strict high-pass filtering has an important limitation.** Removing the DC coefficient makes the generated fast branch's sampled sum zero over each full block. A pure linear accumulation of those samples therefore has no stochastic block-mean increment. More generally, a strict spectral gap at low frequency is not the standard Hasselmann forcing assumption: rapidly decorrelating forcing can still have nonzero spectral density near zero frequency.
+**Strict high-pass filtering alone has no zero-frequency forcing.** Removing the DC coefficient makes the generated fast branch's sampled sum zero over each full block, so a linear accumulation of those samples has no stochastic block-mean increment. Hasselmann forcing, by contrast, decorrelates rapidly but has nonzero spectral density near zero frequency. The forcing therefore has a second, **slow stochastic branch**.
 
-The separate history mean is learned from the full target and supplies a route for slow response and bias correction. Past sampled corrections also condition later means. Those paths, changing block boundaries and nonlinear resolved dynamics can produce slow variation, but **they do not prove a Hasselmann red spectrum**. Measure the full concatenated rollout spectrum and autocorrelation, including block boundaries. A stochastic DC/low-frequency branch would be a separate extension and is not part of the current strict-high-pass DDPM. The resulting response should be compared against memory-only and noise-without-memory ablations.
+## Zero-frequency AR(1) branch
+
+After the history mean is fitted, the block mean of the training innovation
+
+\[
+ d_n = \frac1K\sum_{j=0}^{K-1}\bigl(r_{n+j}-\mu_\theta(h_n)_j\bigr)
+\]
+
+is exactly the part the fast DDPM cannot generate. Its channel covariance \(\Sigma=LL^\top\) and its pooled lag-one correlation between consecutive blocks \(\phi\) are fitted on training windows. During rollout each block receives a block-constant normalized forcing
+
+\[
+ s_{b+1}=\phi s_b+\sqrt{1-\phi^2}\,L z_b,\qquad s_0=Lz_0,
+\]
+
+which is stationary with covariance \(\Sigma\). For a slow variable with damping \(\lambda\), \(\dot y=-\lambda y+s\), the response variance grows like that of a random walk until \(t\sim1/\lambda\), then saturates with a red spectrum: the Hasselmann mechanism. Zero-sum fast forcing gives no such accumulation (`tests/test_long_term_noise.py` checks both). A single pooled \(\phi\) keeps the vector process stationary for any \(\Sigma\); channel-dependent memory is a possible extension.
+
+## Spatially correlated draws
+
+Column-wise networks with independent column noise produce spatially white forcing. On TL63 about half of its variance is beyond the spectral truncation and the resolved remainder sits at the smallest scales, where hyperdiffusion removes it (a 6-hour temperature response of 38% of the injected amount, against 86% for a smooth pattern). All Gaussian draws, the DDPM prior and every reverse-step noise as well as the AR(1) shocks, therefore come from isotropic fields with spectral variance \(\exp(-l(l+1)L^2/(2R^2))\) (`noise_correlation_km`), normalized to unit pointwise variance. Because the denoiser is column-wise, each column's marginal reverse process is unchanged; only the cross-column covariance becomes realistic. Training estimates the zonal correlation length of the fast and block-mean innovations separately (`correlation_km_fast`, `correlation_km_slow`) and forecasts use them unless overridden; 500 km is only the fallback for older checkpoints. Draws are independent across (mode, channel), so inter-channel structure comes from the denoiser alone.
+
+## Amplitude calibration and memory consistency
+
+A small denoiser with few reverse steps does not reproduce the target variance; a known Gaussian test showed 1.35–1.8× inflation, while the exact-score sampler itself under-disperses by 6–13%. After training, a per-(mode, channel) gain matching sample spread to held-out innovation spread is fitted on validation windows and applied to the DCT coefficients.
+
+The history network was trained on past *residuals*. In rollout the memory therefore stores the closure's own unscaled residual estimate (mean + noise, before `correction_scale`), and only the applied forcing is scaled. The pure-base first interval stores the training-mean residual, which normalizes to zero, instead of an out-of-distribution exact zero.
+
+The history mean, prior sampled corrections conditioning later means, and the nonlinear resolved dynamics are additional slow pathways. None of this proves a realistic low-frequency spectrum; measure rollout spectra, autocorrelation and drift, and compare `full`, `memory` (mean only), `noise` (noise only) and `off`.
+
+## Closed loop: does generated noise reach future memory?
+
+In a forecast every generated correction (mean + noise) enters the history, so block n's DDPM sample conditions block n+1's memory mean μ and its DDPM draw. `experiments/closure_loop_check.py` runs the closure alone over the validation split with true resolved states and its own past corrections, once with noise (`full`) and once without (`memory`), from one seed. μ(full) − μ(memory) is the memory's response to past generated noise. Measured on the small real-data test (2.8° checkpoint, train December 2019, validate January 2020, `noise_scale` 1):
+
+| | 48 h cutoff (k = 1 unmodelled) | 96 h cutoff (also phase input) | real residual |
+|---|---|---|---|
+| rms of generated / real residual | 0.90–0.92 | 0.98–1.00 | 1 |
+| 6 h autocorrelation inside blocks | 0.09–0.19 | 0.20–0.29 | 0.22–0.32 |
+| 6 h autocorrelation across block boundaries | 0.08–0.16 | 0.07–0.14 | 0.22–0.33 |
+| autocorrelation at 30–36 h (T) | 0.15–0.16 | 0.07 | 0.06–0.08 |
+| μ response at the next block's first step / previous noise rms | 0.20–0.28 | 0.20–0.28 | — |
+| regression of that response on the last noise value | 0.06–0.12 | 0.06–0.11 | — |
+| rms drift over 8 blocks | ≤ 2% | ≤ 2% | — |
+
+So generated noise does feed future memory: about a quarter of its rms reappears in the next block's mean, with the same sign (correlation 0.3–0.4), and the loop is stable. The transfer is weak, though. Inside blocks the 96 h cutoff reproduces the real lag structure; across boundaries the generated sequence keeps only about half of the real 6 h correlation. That boundary deficit is what the memory would have to carry and currently does not, after one month of training (μ explains 3–6% of the residual variance). A solar-phase input (`phase_features`) left μ unchanged (R² identical to three digits), and a fixed per-column diurnal bias explains about 1% of temperature and nothing of the winds, so the 24 h autocorrelation peak is weather-dependent and stays in the noise, where the DDPM partly reproduces it.
+
+## Noise strength
+
+`noise_scale` multiplies both noise branches and is the knob to tune. `fast_noise_scale` (DDPM) and `slow_noise_scale` (AR(1)) multiply one branch each on top of it and are meant for ablations. Their ratio sets the temporal spectrum of the generated noise: in the closed-loop check below, fast 0.5 with slow 1 made the block-constant part dominate (6 h autocorrelation 0.5 inside blocks, 0.2 across them; real residual 0.25 in both places), while equal scales gave a stationary sequence. Correlated draws change the short-range impact of the same nominal amplitude: on the TL63 core with a unit-variance (gain-normalized) untrained sampler, the day-1 temperature response was 0.093 K for independent columns and 0.174 K for correlated draws (day 5: 0.32 and 0.47 K), at equal forcing rms of 0.75 K/day. Keeping the previous short-range impact therefore needs a scale near 0.5, which the example configurations use (as `noise_scale`) as a conservative start. The real choice is made on validation data with `ngcm-mz-workflow calibrate` (`configs/calibrate.example.json`, `noise_scales`): every case must pass the day 1/3/5 RMSE gate, and among those the scale whose median spread/skill is closest to 1 (at most 1 + tolerance) wins, else 0.
+
+The clip (`tendency_clip_std`) acts after the strengths. If raw closure output exceeds it, the clip and not the strength sets the amplitude; an untrained sampler produced about 300σ and made every scale identical until its gain was normalized. Check the clipped fraction on trained checkpoints.
+
+With K = 8 six-hour steps the cutoff is 96 h, so the DDPM covers every mode k ≥ 1. With the earlier 48 h cutoff, mode k = 1 (96 h period, 15% of the measured innovation energy) was in neither branch and was carried only by the history mean; checkpoints trained that way keep the gap.
 
 ## What 40-day evaluation establishes
 

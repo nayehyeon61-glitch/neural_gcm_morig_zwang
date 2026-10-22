@@ -44,7 +44,7 @@ def test_history_contains_only_past_residuals():
                               latitudes=np.array([-30, 30]))
     norm = {"state_mean": np.array([0.]), "state_std": np.array([1.]),
             "residual_mean": np.array([0.]), "residual_std": np.array([1.])}
-    config = TrainingConfig(history_steps=4, block_steps=4, batch_columns=2)
+    config = TrainingConfig(history_steps=4, block_steps=4, batch_columns=2, phase_features=False)
     history, target = sample_batch(archive, [8], config, norm, np.random.default_rng(0))
     np.testing.assert_array_equal(history[0, :, 0], [5, 6, 7, 8])
     np.testing.assert_array_equal(history[0, :, 1], [1004, 1005, 1006, 1007])

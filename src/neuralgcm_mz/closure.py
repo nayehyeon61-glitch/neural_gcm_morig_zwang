@@ -8,9 +8,10 @@ import jax
 import jax.numpy as jnp
 
 
-def init_closure(key, history_steps, channels, block_steps, hidden=128):
+def init_closure(key, history_steps, channels, block_steps, hidden=128, extra=0):
+    """``extra`` per-step inputs beyond state and correction (e.g. solar phase)."""
     a, b = jax.random.split(key)
-    inputs = history_steps * channels * 2
+    inputs = history_steps * (channels * 2 + extra)
     return {
         "w1": jax.random.normal(a, (inputs, hidden)) / jnp.sqrt(float(inputs)),
         "b1": jnp.zeros(hidden),
@@ -20,7 +21,7 @@ def init_closure(key, history_steps, channels, block_steps, hidden=128):
 
 
 def predict_closure(params, history):
-    """[columns, history, 2*channels] -> [columns, future_time, channels]."""
+    """[columns, history, 2*channels(+extra)] -> [columns, future_time, channels]."""
     features = history.reshape((history.shape[0], -1))
     hidden = jax.nn.silu(features @ params["w1"] + params["b1"])
     return jnp.einsum("bh,hkc->bkc", hidden, params["w2"]) + params["b2"]

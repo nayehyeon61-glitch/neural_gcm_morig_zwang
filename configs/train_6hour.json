@@ -2,7 +2,7 @@
   "history_steps": 8,
   "block_steps": 8,
   "dt_hours": 6.0,
-  "max_period_hours": 48.0,
+  "max_period_hours": 96.0,
   "hidden": 128,
   "diffusion_steps": 32,
   "batch_columns": 64,
@@ -14,5 +14,7 @@
   "gradient_clip": 1.0,
   "seed": 42,
   "memory_limit_gb": 96.0,
-  "normalization_chunk_steps": 4
+  "normalization_chunk_steps": 4,
+  "calibration_batches": 16,
+  "slow_noise_batches": 64
 }
