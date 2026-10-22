@@ -223,6 +223,16 @@ def test_calibrate_searches_correction_and_noise_jointly(tmp_path, monkeypatch):
                                  "run_directory": str(tmp_path / "cal"), "cases": [{"issue_time": "2020-01-10"}]})
     assert runs == [(0.0, 0.0), (0.5, 0.5), (0.5, 1.0), (1.0, 0.5), (1.0, 1.0)]  # gamma 0 run once
     assert (result["chosen_correction_scale"], result["chosen_noise_scale"]) == (0.5, 1.0)
+    # Resume after a crash: cases with an evaluation report are kept, others redone.
+    import json
+    for name in ("gamma_0_scale_0", "gamma_0.5_scale_0.5"):
+        (tmp_path / "cal" / name / "case_000").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "cal" / name / "case_000" / "evaluation.json").write_text(json.dumps(
+            {"leads": {d: {"spread_skill_ratio": [0.3]} for d in ("1", "3", "5")}, "short_range_gate": {"passed": True}}))
+    runs.clear()
+    again = workflow.calibrate({"noise_scales": [0.5, 1.0], "correction_scales": [0, 0.5, 1.0], "resume": True,
+                                "run_directory": str(tmp_path / "cal"), "cases": [{"issue_time": "2020-01-10"}]})
+    assert runs == [(0.5, 1.0), (1.0, 0.5), (1.0, 1.0)] and again["chosen_noise_scale"] == 1.0
     with pytest.raises(ValueError, match="correction_scales"):
         workflow.calibrate({"noise_scales": [1.0], "correction_scales": [1.5],
                             "run_directory": str(tmp_path / "cal2"), "cases": []})

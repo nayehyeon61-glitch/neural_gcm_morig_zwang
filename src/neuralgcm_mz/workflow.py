@@ -8,6 +8,7 @@ from collections import deque
 import argparse
 import glob
 import hashlib
+import shutil
 import json
 from pathlib import Path
 import numpy as np
@@ -126,12 +127,23 @@ def prepare(config):
     variables,names,units=_variables(config,backend)
     output=Path(config['archive'])
     temporary=Path(str(output)+'.preparation')
-    temporary.mkdir(parents=True,exist_ok=False)
     n=len(reader.times)
     sigma,lon,lat=backend.sigma_shape
     shape=(len(names),lat,lon)
-    truth=np.lib.format.open_memmap(temporary/'truth.npy',mode='w+',dtype='float32',shape=(n,*shape))
-    predictions=np.lib.format.open_memmap(temporary/'baseline.npy',mode='w+',dtype='float32',shape=(n-1,*shape))
+    # resume: continue an interrupted preparation from its first interval
+    # with no stored prediction (the arrays are written in time order).
+    resume=bool(config.get('resume',False)) and temporary.exists()
+    if not resume:
+        temporary.mkdir(parents=True,exist_ok=False)
+    mode='r+' if resume else 'w+'
+    truth=np.lib.format.open_memmap(temporary/'truth.npy',mode=mode,dtype='float32',shape=(n,*shape))
+    predictions=np.lib.format.open_memmap(temporary/'baseline.npy',mode=mode,dtype='float32',shape=(n-1,*shape))
+    if resume and (truth.shape!=(n,*shape) or predictions.shape!=(n-1,*shape)):
+        raise ValueError('Interrupted preparation does not match this configuration')
+    # A row counts as stored when almost none of its values are exactly zero
+    # (an interrupted write leaves zero pages); the last stored row is redone.
+    stored=lambda row: np.mean(row==0)<0.01
+    start=max(0,next((i for i in range(n-1) if not (stored(truth[i]) and stored(predictions[i]))),n-1)-1) if resume else 0
     rng=jax.random.PRNGKey(config.get('encoder_seed',0))
     # warm_memory: start each interval with NeuralGCM's memory set to the
     # state one native step earlier on the previous interval's trajectory,
@@ -140,7 +152,14 @@ def prepare(config):
     # 2.8 deg checkpoint) into the residuals that forecasts never see.
     warm=bool(config.get('warm_memory',False))
     previous=None
-    for i in range(n):
+    if warm and start>0:
+        # Rebuild the carried memory from the interval before the restart;
+        # that interval itself starts cold, a one-interval approximation.
+        _,inputs,forcing=reader.record(start-1)
+        state=backend.encode(inputs,forcing,rng_key=rng)
+        previous=backend.advance_interval(state,forcing,dt-backend.timestep_seconds)
+    if start: print(f'resuming at interval {start}/{n-1}',flush=True)
+    for i in range(start,n):
         check_process_memory(config.get('memory_limit_gb',96)*1e9/1024**3)
         _,inputs,forcing=reader.record(i)
         state=backend.encode(inputs,forcing,rng_key=rng)
@@ -473,7 +492,9 @@ def calibrate(config):
     if joint and (not gammas or any((not np.isfinite(v)) or not 0<=v<=1 for v in gammas)):
         raise ValueError('correction_scales must be a nonempty list of numbers in [0, 1]')
     grid=[(g,s) for g in gammas for s in ([0.0] if g==0 else scales)]
-    root=Path(config['run_directory']); root.mkdir(parents=True,exist_ok=False)
+    # resume: keep cases that already have an evaluation report.
+    resume=bool(config.get('resume',False))
+    root=Path(config['run_directory']); root.mkdir(parents=True,exist_ok=resume)
     tolerance=float(config.get('spread_tolerance',0.1))
     rows=[]
     for gamma,scale in grid:
@@ -485,6 +506,11 @@ def calibrate(config):
                 raise ValueError('Calibration uses validation cases only')
             out=root/name/f'case_{i:03d}'
             out.parent.mkdir(parents=True,exist_ok=True)
+            if resume and (out/'evaluation.json').exists():
+                reports.append(json.loads((out/'evaluation.json').read_text()))
+                continue
+            if resume and out.exists():
+                shutil.rmtree(out)                  # interrupted case: redo it
             forecast({**config.get('forecast',{}),**case,**settings,
                       'evaluation_split':'validation','output':str(out)})
             reports.append(verify({**config.get('verify',{}),'forecast_output':str(out),

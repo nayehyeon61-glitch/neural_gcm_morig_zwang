@@ -231,6 +231,32 @@ def test_prepare_warm_memory_uses_previous_trajectory(tmp_path, monkeypatch):
     assert len(backend.forcing_times) == 2 * 11  # two legs per interval
 
 
+def test_prepare_resumes_interrupted_preparation(tmp_path, monkeypatch):
+    backend = FakeBackend()
+    FakeReader.max_allowed = None
+    monkeypatch.setattr(workflow, "_backend", lambda config: backend)
+    monkeypatch.setattr(workflow, "ERA5Reader", FakeReader)
+    base_checkpoint = tmp_path/"trusted.pkl"
+    base_checkpoint.write_bytes(b"fake-backend-checkpoint-identity")
+    path = tmp_path/"archive"
+    config = {"neuralgcm_checkpoint": str(base_checkpoint), "variables": ["temperature"],
+              "era5": "dummy", "archive": str(path), "dt_hours": 24, "keep_preparation": True}
+    workflow.prepare(config)
+    full = np.array(ResidualArchive(path).residual)
+    # Simulate a crash after interval 5: later rows were never written.
+    from pathlib import Path
+    scratch = Path(str(path)+".preparation")
+    truth = np.load(scratch/"truth.npy", mmap_mode="r+"); predictions = np.load(scratch/"baseline.npy", mmap_mode="r+")
+    truth[0] = 0.5                     # the fake encodes interval 0 as exact zeros
+    truth[6:] = 0; predictions[6:] = 0; predictions[5, 0, 0, 0] = 0   # row 5 partly written
+    truth.flush(); predictions.flush(); del truth, predictions
+    import shutil; shutil.rmtree(path)
+    calls = len(backend.forcing_times)
+    workflow.prepare({**config, "resume": True})
+    assert len(backend.forcing_times) - calls == 11 - 4    # restarts at the last stored row (4)
+    np.testing.assert_array_equal(np.array(ResidualArchive(path).residual)[4:], full[4:])
+
+
 def test_forecast_rejects_wrong_backbone_checkpoint_before_rollout(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow, "_backend", lambda config: FakeBackend())
     monkeypatch.setattr(workflow, "load_checkpoint", lambda path: {
